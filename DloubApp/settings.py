@@ -79,7 +79,7 @@ WSGI_APPLICATION = 'DloubApp.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'mssql',
-        'NAME': 'services_db',
+        'NAME': 'Prueba_app',
         'HOST': 'DORUAIN-SDO\DORUAIN',  # Ajusta según tu configuración
         'PORT': '1433',  # Puerto predeterminado para SQL Server
         'OPTIONS': {
