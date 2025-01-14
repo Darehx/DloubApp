@@ -2,7 +2,6 @@ from rest_framework import serializers
 from .models import FormQuestion, FormResponse, Form
 
 
-
 class FormQuestionSerializer(serializers.ModelSerializer):
     class Meta:
         model = FormQuestion
@@ -13,6 +12,7 @@ class FormResponseSerializer(serializers.ModelSerializer):
     class Meta:
         model = FormResponse
         fields = ['customer', 'form', 'question', 'text']
+
 
 class FormResponseBulkCreateSerializer(serializers.Serializer):
     customer = serializers.IntegerField()
@@ -30,6 +30,12 @@ class FormResponseBulkCreateSerializer(serializers.Serializer):
             data['form_instance'] = form
         except Form.DoesNotExist:
             raise serializers.ValidationError({"form": "Formulario no encontrado."})
+
+        # Verificar si ya existen respuestas para este cliente y formulario
+        if FormResponse.objects.filter(customer=data['customer'], form=data['form']).exists():
+            raise serializers.ValidationError({
+                "non_field_errors": "Ya existen respuestas registradas para su Brief."
+            })
 
         # Validar preguntas
         question_ids = [response["question"] for response in data["responses"]]
