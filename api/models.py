@@ -1,4 +1,13 @@
 from django.db import models
+from django.contrib.auth.models import User
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+@receiver(post_save, sender=User)
+def create_customer_profile(sender, instance, created, **kwargs):
+    if created:
+        Customer.objects.create(user=instance)
+
 
 
 class Campaigns(models.Model):
@@ -13,9 +22,7 @@ class Campaigns(models.Model):
 
 
 class Customer(models.Model):
-    first_name = models.CharField(max_length=50)
-    last_name = models.CharField(max_length=50)
-    email = models.EmailField(unique=True)
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='customer_profile')
     phone = models.CharField(max_length=20, null=True, blank=True)
     address = models.TextField(null=True, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
@@ -25,6 +32,9 @@ class Customer(models.Model):
         ('phone', 'Phone'),
         ('other', 'Other')
     ], null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.user.get_full_name()} - {self.user.email}"
 
 
 class CustomerProject(models.Model):
@@ -64,15 +74,14 @@ class Order(models.Model):
     status = models.ForeignKey('OrderStatus', on_delete=models.CASCADE)
     payment_due_date = models.DateTimeField(null=True, blank=True)
     note = models.TextField(null=True, blank=True)
+    services = models.ManyToManyField('Service', through='OrderService')  # Relación Many-to-Many
 
 
 class OrderStatus(models.Model):
     name = models.CharField(max_length=50)
 
-
 class PaymentMethod(models.Model):
     name = models.CharField(max_length=50, unique=True)
-
 
 class Payment(models.Model):
     invoice = models.ForeignKey('Invoice', on_delete=models.CASCADE)
@@ -81,11 +90,9 @@ class Payment(models.Model):
     date = models.DateTimeField(auto_now_add=True)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
 
-
 class Invoice(models.Model):
     order = models.ForeignKey(Order, on_delete=models.CASCADE)
     date = models.DateTimeField(auto_now_add=True)
-
 
 class Service(models.Model):
     code = models.CharField(max_length=50, primary_key=True)
@@ -94,8 +101,16 @@ class Service(models.Model):
     ventulab = models.BooleanField(default=False, help_text="Indica si el servicio es parte del programa Ventulab")
     has_subservices = models.BooleanField(default=False, help_text="Indica si el servicio tiene subservicios asociados")
     campaign = models.ForeignKey('Campaigns', on_delete=models.SET_NULL, null=True, blank=True, help_text="Campaña asociada al servicio")
+
     def __str__(self):
         return self.name or self.code
+
+class OrderService(models.Model):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE)
+    service = models.ForeignKey(Service, on_delete=models.CASCADE)
+    quantity = models.PositiveIntegerField(default=1)  # Opcional: para registrar cantidad del servicio
+    price = models.DecimalField(max_digits=10, decimal_places=2)  # Opcional: para registrar el precio del servicio
+    note = models.TextField(null=True, blank=True)  # Opcional: notas adicionales
 
 
 class SubService(models.Model):
