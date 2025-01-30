@@ -38,37 +38,22 @@ class FormResponseViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(customer=self.request.user.customer_profile)
 
-    @action(detail=False, methods=['post'])
-    def bulk_create(self, request):
-        """
-        Creación masiva de respuestas:
-        Ejemplo de body request:
-        [
-            {
-                "form_id": 1,
-                "answers": {"pregunta1": "respuesta1"},
-                "metadata": {"tiempo": "2min"}
-            },
-            {
-                "form_id": 1,
-                "answers": {"pregunta1": "respuesta2"},
-                "metadata": {"tiempo": "3min"}
-            }
-        ]
-        """
-        serializer = FormResponseBulkCreateSerializer(
-            data=request.data,
-            context={'customer': request.user.customer_profile}
+@action(detail=False, methods=['post'])
+def bulk_create(self, request):
+    """
+    Creación masiva de respuestas:
+    """
+    serializer = FormResponseBulkCreateSerializer(
+        data=request.data,
+        context={'customer': request.user.customer_profile}
+    )
+    if serializer.is_valid():
+        serializer.save()
+        return Response(
+            {"message": f"{len(serializer.validated_data)} respuestas creadas exitosamente."},
+            status=status.HTTP_201_CREATED
         )
-
-        if serializer.is_valid():
-            serializer.save()
-            return Response(
-                {"message": f"{len(serializer.validated_data)} respuestas creadas exitosamente."},
-                status=status.HTTP_201_CREATED
-            )
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 # ---------------------- Autenticación ----------------------
 
@@ -106,6 +91,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 # ---------------------- Gestión de Pedidos ----------------------
 
 class OrderViewSet(viewsets.ModelViewSet):
+    queryset = Order.objects.all()  # Añade esta línea
     serializer_class = OrderSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
@@ -125,6 +111,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
 
 class DeliverableViewSet(viewsets.ModelViewSet):
+    queryset = Deliverable.objects.all()  # Asegúrate de que haya un queryset
     serializer_class = DeliverableSerializer
     permission_classes = [permissions.IsAuthenticated]
 
