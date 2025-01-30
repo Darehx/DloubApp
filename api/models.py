@@ -2,6 +2,7 @@ from django.db import models
 from django.contrib.auth.models import User
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+import datetime
 
 # ---------------------- Modelos Base ----------------------
 @receiver(post_save, sender=User)
@@ -90,7 +91,7 @@ class JobPosition(models.Model):
 
 class Employee(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='employee_profile')
-    hire_date = models.DateField()
+    hire_date = models.DateField(default=datetime.date.today)
     address = models.TextField(null=True, blank=True)
     salary = models.DecimalField(max_digits=10, decimal_places=2)
     active = models.BooleanField(default=True)
