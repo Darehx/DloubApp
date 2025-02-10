@@ -1,33 +1,35 @@
-from rest_framework import viewsets, generics, permissions, status, serializers
+from rest_framework import viewsets, generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from .models import *
 from .serializers import *
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db import models
 
+
+
+from rest_framework_simplejwt.views import TokenObtainPairView
+from .serializers import CustomTokenObtainPairSerializer
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
+    
 # ---------------------- Servicios de Aplicación ----------------------
-
 class FormResponseService:
     @staticmethod
     def bulk_create_responses(validated_data, customer):
-        respuestas = [
-            FormResponse(**item, customer=customer) for item in validated_data
+        form = validated_data['form']
+        responses = [
+            FormResponse(
+                customer=customer,
+                form=form,
+                question=FormQuestion.objects.get(id=item['question']),
+                text=item['text']
+            ) for item in validated_data['responses']
         ]
-        return FormResponse.objects.bulk_create(respuestas)
-
+        return FormResponse.objects.bulk_create(responses)
 
 # ---------------------- Formularios ----------------------
-
-class FormResponseBulkCreateSerializer(serializers.ListSerializer):
-    child = FormResponseSerializer()  # Serializador base para cada ítem
-
-    def create(self, validated_data):
-        customer = self.context['customer']
-        return FormResponseService.bulk_create_responses(validated_data, customer)
-
-
 class FormResponseViewSet(viewsets.ModelViewSet):
     serializer_class = FormResponseSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -36,34 +38,26 @@ class FormResponseViewSet(viewsets.ModelViewSet):
         return FormResponse.objects.filter(customer=self.request.user.customer_profile)
 
     def perform_create(self, serializer):
+        if not hasattr(self.request.user, 'customer_profile'):
+            raise serializers.ValidationError("El usuario no tiene un perfil de cliente.")
         serializer.save(customer=self.request.user.customer_profile)
 
     @action(detail=False, methods=['post'])
     def bulk_create(self, request):
-        """
-        Creación masiva de respuestas:
-        """
         serializer = FormResponseBulkCreateSerializer(
             data=request.data,
-            context={'customer': request.user.customer_profile}
+            context={'request': request}
         )
         if serializer.is_valid():
-            serializer.save()
+            customer = self.request.user.customer_profile
+            FormResponseService.bulk_create_responses(serializer.validated_data, customer)
             return Response(
-                {"message": f"{len(serializer.validated_data)} respuestas creadas exitosamente."},
+                {"message": "Respuestas creadas exitosamente"},
                 status=status.HTTP_201_CREATED
             )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-
-# ---------------------- Autenticación ----------------------
-
-class CustomTokenObtainPairView(TokenObtainPairView):
-    serializer_class = CustomTokenObtainPairSerializer
-
-
 # ---------------------- Usuarios y Perfiles ----------------------
-
 class CustomerViewSet(viewsets.ModelViewSet):
     queryset = Customer.objects.all()
     serializer_class = CustomerSerializer
@@ -73,13 +67,12 @@ class CustomerViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'create':
             return CustomerCreateSerializer
-        return CustomerSerializer
+        return super().get_serializer_class()
 
     def get_permissions(self):
         if self.action == 'create':
             return [permissions.AllowAny()]
         return [permissions.IsAuthenticated()]
-
 
 class EmployeeViewSet(viewsets.ModelViewSet):
     queryset = Employee.objects.all()
@@ -88,11 +81,14 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['position', 'active']
 
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return EmployeeCreateSerializer
+        return super().get_serializer_class()
 
 # ---------------------- Gestión de Pedidos ----------------------
-
 class OrderViewSet(viewsets.ModelViewSet):
-    queryset = Order.objects.all()  # Añade esta línea
+    queryset = Order.objects.all()
     serializer_class = OrderSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
@@ -110,9 +106,23 @@ class OrderViewSet(viewsets.ModelViewSet):
         else:
             serializer.save(customer=self.request.user.customer_profile)
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # Manejo de servicios
+        services_data = serializer.validated_data.pop('services', [])
+        order = serializer.save()
+
+        for service_data in services_data:
+            if 'service' not in service_data or 'quantity' not in service_data or 'price' not in service_data:
+                raise serializers.ValidationError("Datos de servicio incompletos.")
+            OrderService.objects.create(order=order, **service_data)
+
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
 class DeliverableViewSet(viewsets.ModelViewSet):
-    queryset = Deliverable.objects.all()  # Asegúrate de que haya un queryset
     serializer_class = DeliverableSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -122,19 +132,19 @@ class DeliverableViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         order_id = self.kwargs.get('order_id')
-        order = Order.objects.get(id=order_id)
+        try:
+            order = Order.objects.get(id=order_id)
+        except Order.DoesNotExist:
+            raise serializers.ValidationError("El pedido especificado no existe.")
         serializer.save(order=order)
 
-
 # ---------------------- Servicios y Catálogo ----------------------
-
 class ServiceViewSet(viewsets.ModelViewSet):
     queryset = Service.objects.filter(is_active=True)
     serializer_class = ServiceSerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['code', 'ventulab', 'campaign']
-
 
 class CampaignViewSet(viewsets.ModelViewSet):
     queryset = Campaign.objects.all()
@@ -143,20 +153,21 @@ class CampaignViewSet(viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['start_date', 'end_date']
 
-
 # ---------------------- Gestión de Pagos ----------------------
-
 class InvoiceViewSet(viewsets.ModelViewSet):
     serializer_class = InvoiceSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
+        if not hasattr(self.request.user, 'customer_profile'):
+            raise serializers.ValidationError("El usuario no tiene un perfil de cliente.")
         return Invoice.objects.filter(order__customer=self.request.user.customer_profile)
-
 
 class PaymentViewSet(viewsets.ModelViewSet):
     serializer_class = PaymentSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
+        if not hasattr(self.request.user, 'customer_profile'):
+            raise serializers.ValidationError("El usuario no tiene un perfil de cliente.")
         return Payment.objects.filter(invoice__order__customer=self.request.user.customer_profile)
