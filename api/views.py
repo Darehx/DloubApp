@@ -5,14 +5,21 @@ from .models import *
 from .serializers import *
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django_filters.rest_framework import DjangoFilterBackend
-
-
-
 from rest_framework_simplejwt.views import TokenObtainPairView
 from .serializers import CustomTokenObtainPairSerializer
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+
 
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
+
+    def post(self, request, *args, **kwargs):
+        logger.debug("Solicitud POST recibida en CustomTokenObtainPairView")
+        return super().post(request, *args, **kwargs)
     
 # ---------------------- Servicios de Aplicación ----------------------
 class FormResponseService:
@@ -85,6 +92,11 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         if self.action == 'create':
             return EmployeeCreateSerializer
         return super().get_serializer_class()
+    
+class JobPositionViewSet(viewsets.ModelViewSet):
+    queryset = JobPosition.objects.all()
+    serializer_class = JobPositionSerializer
+    permission_classes = [permissions.IsAuthenticated]
 
 # ---------------------- Gestión de Pedidos ----------------------
 class OrderViewSet(viewsets.ModelViewSet):

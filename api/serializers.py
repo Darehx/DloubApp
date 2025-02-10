@@ -1,8 +1,19 @@
 from rest_framework import serializers
 from .models import *
 from django.contrib.auth.models import User
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 # ---------------------- Autenticación ----------------------
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+
+        # Agregar claims personalizados al token
+        token['role'] = 'customer' if hasattr(user, 'customer_profile') else 'employee'
+        token['full_name'] = user.get_full_name()
+
+        return token
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -227,3 +238,32 @@ class CampaignServiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = CampaignService
         fields = '__all__'
+        
+# ---------------------- Gestión de Pagos ----------------------
+class TransactionTypeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TransactionType
+        fields = '__all__'
+
+# ---------------------- Proveedores y Colaboradores ----------------------
+class ProviderSerializer(serializers.ModelSerializer):
+    services = serializers.StringRelatedField(many=True)  # Muestra los nombres de los servicios relacionados
+
+    class Meta:
+        model = Provider
+        fields = '__all__'
+
+# ---------------------- Mejoras Adicionales ----------------------
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = '__all__'
+        read_only_fields = ['created_at']
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AuditLog
+        fields = '__all__'
+        read_only_fields = ['timestamp']
+        
+        
