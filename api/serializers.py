@@ -90,6 +90,13 @@ class FormResponseBulkCreateSerializer(serializers.Serializer):
         return FormResponse.objects.bulk_create(responses)
 
 # ---------------------- Usuarios y Perfiles ----------------------
+
+class JobPositionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = JobPosition
+        fields = '__all__'
+
+
 class CustomerCreateSerializer(serializers.ModelSerializer):
     user = UserSerializer()
 
