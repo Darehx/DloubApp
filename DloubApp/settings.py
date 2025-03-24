@@ -117,10 +117,12 @@ REST_FRAMEWORK = {
 }
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",  # Origen de tu frontend
+    "http://localhost:3000", 
+    "http://localhost:4000", # Origen de tu frontend
 ]
 CORS_ALLOW_CREDENTIALS = True  # Permite el envío de cookies
 
+APPEND_SLASH = False
 
 # settings.py
 SIMPLE_JWT = {

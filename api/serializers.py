@@ -2,18 +2,34 @@ from rest_framework import serializers
 from .models import *
 from django.contrib.auth.models import User
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-
+from django.contrib.auth.models import User
 # ---------------------- Autenticación ----------------------
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    def validate(self, attrs):
+        # Obtenemos la respuesta por defecto
+        data = super().validate(attrs)
+        
+        # Agregamos información del usuario a la respuesta
+        data.update({
+            'user': {
+                'id': self.user.id,
+                'username': self.user.username,
+                'email': self.user.email,
+                'full_name': self.user.get_full_name(),
+                'role': 'customer' if hasattr(self.user, 'customer_profile') else 'employee'
+            }
+        })
+        
+        return data
+
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
-
-        # Agregar claims personalizados al token
+        # Agregamos claims al token JWT
         token['role'] = 'customer' if hasattr(user, 'customer_profile') else 'employee'
         token['full_name'] = user.get_full_name()
-
         return token
+
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User

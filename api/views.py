@@ -8,6 +8,8 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework_simplejwt.views import TokenObtainPairView
 from .serializers import CustomTokenObtainPairSerializer
 import logging
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
 
 logger = logging.getLogger(__name__)
 
@@ -183,3 +185,20 @@ class PaymentViewSet(viewsets.ModelViewSet):
         if not hasattr(self.request.user, 'customer_profile'):
             raise serializers.ValidationError("El usuario no tiene un perfil de cliente.")
         return Payment.objects.filter(invoice__order__customer=self.request.user.customer_profile)
+    
+class CheckAuthView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        data = {
+            "isAuthenticated": True,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "full_name": user.get_full_name(),
+                "role": "customer" if hasattr(user, 'customer_profile') else "employee"
+            }
+        }
+        return Response(data)
