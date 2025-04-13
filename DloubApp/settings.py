@@ -3,9 +3,11 @@ import os
 
 # Configuración básica del proyecto
 BASE_DIR = Path(__file__).resolve().parent.parent
-SECRET_KEY = 'django-insecure-7le8=td$=jvc%icgqp0in0)iy3f-1*up&h6u2c+%rzq^$-_63r'
-DEBUG = True
-ALLOWED_HOSTS = []
+import os
+
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-7le8=td$=jvc%icgqp0in0)iy3f-1*up&h6u2c+%rzq^$-_63r')
+DEBUG = False
+ALLOWED_HOSTS = ['localhost']
 
 # Aplicaciones instaladas
 INSTALLED_APPS = [
@@ -19,7 +21,8 @@ INSTALLED_APPS = [
     'corsheaders',  # Manejo de CORS
     'Dloub_Dragon_App',  # Tu aplicación principal
     'api',  # Tu aplicación de API
-    'django_filters',  # Filtros avanzados para DRF
+    'django_filters', # Filtros avanzados para DRF
+    'django_countries',  # Manejo de países 
 ]
 
 # Middleware

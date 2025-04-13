@@ -1,15 +1,48 @@
 from rest_framework import serializers
 from .models import *
 from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.contrib.auth.models import User
+from rest_framework.exceptions import AuthenticationFailed
 # ---------------------- Autenticación ----------------------
+User = get_user_model()
+
+
+
+
+User = get_user_model()
+
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
-        # Obtenemos la respuesta por defecto
+        username = attrs.get("username")
+        password = attrs.get("password")
+
+        # Verificar existencia del usuario
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            raise AuthenticationFailed(
+                {"detail": "El usuario no existe"},
+                code="user_not_found"
+            )
+
+        # Verificar contraseña
+        if not user.check_password(password):
+            raise AuthenticationFailed(
+                {"detail": "Contraseña incorrecta"},
+                code="invalid_credentials"
+            )
+
+        # Verificar estado del usuario
+        if not user.is_active:
+            raise AuthenticationFailed(
+                {"detail": "Tu cuenta está inactiva"},
+                code="user_inactive"
+            )
+
+        # Si todo es correcto, continuar con la lógica original
         data = super().validate(attrs)
-        
-        # Agregamos información del usuario a la respuesta
         data.update({
             'user': {
                 'id': self.user.id,
@@ -19,17 +52,16 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
                 'role': 'customer' if hasattr(self.user, 'customer_profile') else 'employee'
             }
         })
-        
         return data
 
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
-        # Agregamos claims al token JWT
+        # Agregar claims personalizados al token JWT
         token['role'] = 'customer' if hasattr(user, 'customer_profile') else 'employee'
         token['full_name'] = user.get_full_name()
         return token
-
+    
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -179,7 +211,7 @@ class OrderServiceSerializer(serializers.ModelSerializer):
 class OrderSerializer(serializers.ModelSerializer):
     customer = serializers.PrimaryKeyRelatedField(queryset=Customer.objects.all())
     employee = serializers.PrimaryKeyRelatedField(queryset=Employee.objects.all(), required=False)
-    services = OrderServiceSerializer(many=True, source='services')
+    services = OrderServiceSerializer(many=True)
     status_display = serializers.SerializerMethodField()
 
     class Meta:
