@@ -74,6 +74,23 @@ User = get_user_model()
 # ------------------------- VISTAS DE LA API -----------------------------------
 # ==============================================================================
 
+# --- VISTA USER ME ---
+class UserMeView(APIView):
+    """
+    Devuelve la información del usuario actualmente autenticado.
+    """
+    permission_classes = [IsAuthenticated] # Requiere que el usuario esté logueado
+
+    def get(self, request):
+        user = request.user
+        # Usa tu BasicUserSerializer o uno más completo si necesitas más datos
+        serializer = BasicUserSerializer(user, context={'request': request})
+        # Añade el rol dinámicamente como haces en CheckAuthView
+        data = serializer.data
+        data['role'] = 'employee' if hasattr(user, 'employee_profile') else 'customer'
+        return Response(data)
+# --- FIN USER ME ---
+
 # ---------------------- Permisos Personalizados (Opcional) -------------------
 class IsOwnerOrAdmin(BasePermission):
     """Permiso para permitir acceso solo al dueño del objeto o a un admin."""

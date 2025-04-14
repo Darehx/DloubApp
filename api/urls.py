@@ -21,7 +21,8 @@ from .views import (
     CampaignViewSet,
     InvoiceViewSet,
     PaymentViewSet,
-    FormResponseViewSet, # Añadido
+    FormResponseViewSet,
+    UserMeView,# Añadido
 
     # Vistas Personalizadas (APIView)
     DashboardDataView,
@@ -66,6 +67,8 @@ urlpatterns = [
     # --- Ruta del Dashboard ---
     path('dashboard/', DashboardDataView.as_view(), name='dashboard_data'),
 
+
+    path('users/me/', UserMeView.as_view(), name='user-me'),
     # --- Rutas Anidadas Manuales (Alternativa si NO usas drf-nested-routers) ---
     # Descomenta estas líneas y comenta las de orders_router si prefieres rutas manuales:
     # path('orders/<int:order_pk>/deliverables/', DeliverableViewSet.as_view({'get': 'list', 'post': 'create'}), name='order-deliverables-list'),
