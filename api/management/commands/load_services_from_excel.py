@@ -8,7 +8,7 @@ from datetime import datetime
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
-from django.utils.timezone import make_aware
+from django.utils.timezone import make_aware, timezone
 
 # Importa los modelos relevantes de tu app
 from api.models import ServiceCategory, Campaign, Service, Price, ServiceFeature

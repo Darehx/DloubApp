@@ -1,121 +1,264 @@
 # api/models.py
 
-from django.db import models
-from django.contrib.auth.models import User
-from django.db.models.signals import post_save, pre_save, post_delete
-from django.dispatch import receiver
-from django.utils import timezone
-from django.db.models import Sum, F, ExpressionWrapper, DurationField, Avg, DecimalField
-from django_countries.fields import CountryField
-from django.urls import reverse # Para generar links en notificaciones
-from django.conf import settings # Para construir URLs absolutas si es necesario
 import datetime
+import logging
 from decimal import Decimal
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.db.models import Avg, DecimalField, DurationField, ExpressionWrapper, F, Sum
+from django.db.models.signals import post_delete, post_save, pre_save
+from django.dispatch import receiver
+from django.urls import reverse
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from django_countries.fields import CountryField
+
+# --- Importa tus constantes de roles ---
+try:
+    from .roles import Roles
+except ImportError:
+    # Define placeholders si el archivo no existe (la app podría fallar si no existen realmente)
+    class Roles:
+        DRAGON = 'dragon'; ADMIN = 'admin'; MARKETING = 'mktg'; FINANCE = 'fin'
+        SALES = 'sales'; DEVELOPMENT = 'dev'; AUDIOVISUAL = 'avps'; DESIGN = 'dsgn'
+        SUPPORT = 'support'; OPERATIONS = 'ops'; HR = 'hr'
+    print("ADVERTENCIA: api/roles.py no encontrado. Usando roles placeholder.")
+
 
 # --- Helper para obtener usuario actual (requiere django-crum) ---
 try:
     from crum import get_current_user
 except ImportError:
-    get_current_user = lambda: None # Fallback si crum no está instalado
+    get_current_user = lambda: None
     print("ADVERTENCIA: django-crum no está instalado. Los AuditLogs no registrarán el usuario.")
+
+# Configurar logger para este módulo
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# ------ MODELOS DE GESTIÓN DE USUARIOS, ROLES Y PERFILES ---------------------
+# ==============================================================================
+
+class UserRole(models.Model):
+    """Define los roles disponibles en la aplicación (Primarios y Secundarios)."""
+    name = models.CharField(
+        _("Internal Name"), max_length=50, unique=True,
+        help_text=_("Short internal alias (e.g., 'dev', 'mktg'). Use constants from roles.py.")
+    )
+    display_name = models.CharField(
+        _("Display Name"), max_length=100,
+        help_text=_("User-friendly name shown in interfaces.")
+    )
+    description = models.TextField(_("Description"), blank=True)
+    is_active = models.BooleanField(_("Is Active"), default=True)
+    created_at = models.DateTimeField(_("Created At"), auto_now_add=True)
+    updated_at = models.DateTimeField(_("Updated At"), auto_now=True)
+
+    class Meta:
+        verbose_name = _("User Role")
+        verbose_name_plural = _("User Roles")
+        ordering = ['display_name']
+
+    def __str__(self):
+        return self.display_name
+
+class UserProfile(models.Model):
+    """Extiende el modelo User para almacenar el rol principal obligatorio."""
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE, primary_key=True, related_name='profile', verbose_name=_("User")
+    )
+    primary_role = models.ForeignKey(
+        UserRole, on_delete=models.PROTECT, null=True, blank=False, # null=True temporal para señal
+        related_name='primary_users', verbose_name=_("Primary Role"),
+        help_text=_("The main mandatory role defining the user's core function.")
+    )
+    created_at = models.DateTimeField(_("Created At"), auto_now_add=True)
+    updated_at = models.DateTimeField(_("Updated At"), auto_now=True)
+
+    class Meta:
+        verbose_name = _("User Profile")
+        verbose_name_plural = _("User Profiles")
+
+    def __str__(self):
+        role_name = self.primary_role.display_name if self.primary_role else _("No primary role assigned")
+        username = self.user.get_username() if hasattr(self, 'user') else 'N/A'
+        return f"{username} - Profile ({role_name})"
+
+    def clean(self):
+        if not self.primary_role_id:
+            raise ValidationError({'primary_role': _('A primary role must be assigned.')})
+
+class UserRoleAssignment(models.Model):
+    """Vincula un Usuario con un Rol SECUNDARIO (Acceso) específico."""
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='secondary_role_assignments', verbose_name=_("User")
+    )
+    role = models.ForeignKey(
+        UserRole, on_delete=models.CASCADE,
+        related_name='secondary_assignments', verbose_name=_("Secondary Role/Access")
+    )
+    is_active = models.BooleanField(_("Assignment Active"), default=True)
+    assigned_at = models.DateTimeField(_("Assigned At"), auto_now_add=True)
+    updated_at = models.DateTimeField(_("Updated At"), auto_now=True)
+
+    class Meta:
+        unique_together = ('user', 'role')
+        verbose_name = _("Secondary Role / Access Assignment")
+        verbose_name_plural = _("Secondary Role / Access Assignments")
+        ordering = ['user__username', 'role__display_name']
+
+    def __str__(self):
+        status = _("Active") if self.is_active else _("Inactive")
+        username = self.user.get_username() if hasattr(self, 'user') else 'N/A'
+        role_name = self.role.display_name if hasattr(self, 'role') else 'N/A'
+        return f"{username} - Access: {role_name} ({status})"
+
+    def clean(self):
+        if self.user_id and self.role_id:
+            try:
+                primary_role_id = UserProfile.objects.filter(user_id=self.user_id).values_list('primary_role_id', flat=True).first()
+                if primary_role_id and primary_role_id == self.role_id:
+                    raise ValidationError({'role': _('This role is already assigned as the primary role for this user.')})
+            except Exception as e:
+                 logger.warning(f"Excepción durante validación de UserRoleAssignment.clean: {e}")
+                 pass
 
 # ==============================================================================
 # ---------------------- MODELOS DE LA APLICACIÓN -----------------------------
 # ==============================================================================
 
-# ---------------------- Formularios ----------------------
 class Form(models.Model):
-    name = models.CharField(max_length=100)
-    description = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    """Modelo para definir estructuras de formularios."""
+    name = models.CharField(_("Nombre del Formulario"), max_length=100)
+    description = models.TextField(_("Descripción"), blank=True)
+    created_at = models.DateTimeField(_("Fecha de Creación"), auto_now_add=True)
 
     class Meta:
-        verbose_name = "Formulario"
-        verbose_name_plural = "Formularios"
+        verbose_name = _("Formulario")
+        verbose_name_plural = _("Formularios")
+        ordering = ['name']
 
     def __str__(self):
         return self.name
 
 class FormQuestion(models.Model):
-    form = models.ForeignKey(Form, on_delete=models.CASCADE, related_name='questions')
-    question_text = models.TextField()
-    order = models.PositiveIntegerField(default=0, help_text="Orden de aparición en el formulario")
-    required = models.BooleanField(default=True)
+    """Pregunta específica dentro de un formulario."""
+    form = models.ForeignKey(
+        Form, on_delete=models.CASCADE, related_name='questions', verbose_name=_("Formulario")
+    )
+    question_text = models.TextField(_("Texto de la Pregunta"))
+    order = models.PositiveIntegerField(
+        _("Orden"), default=0, help_text=_("Orden de aparición en el formulario")
+    )
+    required = models.BooleanField(_("Requerida"), default=True)
 
     class Meta:
         ordering = ['form', 'order']
-        verbose_name = "Pregunta de Formulario"
-        verbose_name_plural = "Preguntas de Formularios"
+        verbose_name = _("Pregunta de Formulario")
+        verbose_name_plural = _("Preguntas de Formularios")
 
     def __str__(self):
-        return f"{self.form.name} - P{self.order}: {self.question_text[:50]}..."
+        form_name = self.form.name if hasattr(self, 'form') else 'N/A'
+        return f"{form_name} - P{self.order}: {self.question_text[:50]}..."
 
 class FormResponse(models.Model):
-    customer = models.ForeignKey('Customer', on_delete=models.CASCADE, related_name='form_responses')
-    form = models.ForeignKey(Form, on_delete=models.CASCADE, related_name='responses')
-    question = models.ForeignKey(FormQuestion, on_delete=models.CASCADE, related_name='responses')
-    text = models.TextField(help_text="Respuesta proporcionada por el cliente")
-    created_at = models.DateTimeField(auto_now_add=True)
+    """Respuesta de un cliente a una pregunta de un formulario."""
+    customer = models.ForeignKey(
+        'Customer', on_delete=models.CASCADE, related_name='form_responses', verbose_name=_("Cliente")
+    )
+    form = models.ForeignKey(
+        Form, on_delete=models.CASCADE, related_name='responses', verbose_name=_("Formulario")
+    )
+    question = models.ForeignKey(
+        FormQuestion, on_delete=models.CASCADE, related_name='responses', verbose_name=_("Pregunta")
+    )
+    text = models.TextField(_("Respuesta"), help_text=_("Respuesta proporcionada por el cliente"))
+    created_at = models.DateTimeField(_("Fecha de Respuesta"), auto_now_add=True)
 
     class Meta:
         unique_together = ('customer', 'form', 'question')
         ordering = ['created_at']
-        verbose_name = "Respuesta de Formulario"
-        verbose_name_plural = "Respuestas de Formularios"
+        verbose_name = _("Respuesta de Formulario")
+        verbose_name_plural = _("Respuestas de Formularios")
 
     def __str__(self):
-        return f"Respuesta de {self.customer} a {self.question}"
+        customer_str = str(self.customer) if hasattr(self, 'customer') else 'N/A'
+        question_str = str(self.question) if hasattr(self, 'question') else 'N/A'
+        return f"{_('Respuesta')} de {customer_str} a {question_str}"
 
-# ---------------------- Gestión de Clientes ----------------------
 class Customer(models.Model):
-    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='customer_profile')
-    phone = models.CharField(max_length=30, null=True, blank=True)
-    address = models.TextField(null=True, blank=True)
-    date_of_birth = models.DateField(null=True, blank=True)
-    country = CountryField(blank=True, null=True, help_text="País del cliente")
-    company_name = models.CharField(max_length=150, blank=True, null=True, help_text="Nombre de la empresa (si aplica)")
-    created_at = models.DateTimeField(auto_now_add=True)
-    preferred_contact_method = models.CharField(max_length=20, choices=[
-        ('email', 'Email'),
-        ('phone', 'Teléfono'),
-        ('whatsapp', 'WhatsApp'),
-        ('other', 'Otro')
-    ], null=True, blank=True)
-    brand_guidelines = models.FileField(upload_to='customers/brand_guidelines/', null=True, blank=True)
+    """Perfil de un cliente."""
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='customer_profile', verbose_name=_("Usuario")
+    )
+    phone = models.CharField(_("Teléfono"), max_length=30, null=True, blank=True)
+    address = models.TextField(_("Dirección"), null=True, blank=True)
+    date_of_birth = models.DateField(_("Fecha de Nacimiento"), null=True, blank=True)
+    country = CountryField(
+        _("País"), blank=True, null=True, help_text=_("País del cliente")
+    )
+    company_name = models.CharField(
+        _("Nombre de Empresa"), max_length=150, blank=True, null=True, help_text=_("Nombre de la empresa (si aplica)")
+    )
+    created_at = models.DateTimeField(_("Fecha de Creación"), auto_now_add=True)
+    preferred_contact_method = models.CharField(
+        _("Método Contacto Preferido"), max_length=20,
+        choices=[('email', 'Email'), ('phone', 'Teléfono'), ('whatsapp', 'WhatsApp'), ('other', 'Otro')],
+        null=True, blank=True
+    )
+    brand_guidelines = models.FileField(
+        _("Guías de Marca"), upload_to='customers/brand_guidelines/', null=True, blank=True
+    )
 
     class Meta:
-        verbose_name = "Cliente"
-        verbose_name_plural = "Clientes"
+        verbose_name = _("Cliente")
+        verbose_name_plural = _("Clientes")
         ordering = ['user__first_name', 'user__last_name']
 
     def __str__(self):
         display_name = self.company_name or self.user.get_full_name() or self.user.username
-        return f"{display_name} ({self.user.email})"
+        email = self.user.email if hasattr(self, 'user') else 'N/A'
+        return f"{display_name} ({email})"
 
-# ---------------------- Gestión de Empleados ----------------------
 class JobPosition(models.Model):
-    name = models.CharField(max_length=50, unique=True)
-    description = models.TextField(null=True, blank=True)
-    permissions = models.JSONField(default=dict, blank=True, help_text="Permisos específicos para este puesto (estructura JSON)")
+    """Puesto de trabajo dentro de la organización."""
+    name = models.CharField(_("Nombre del Puesto"), max_length=50, unique=True)
+    description = models.TextField(_("Descripción"), null=True, blank=True)
+    permissions = models.JSONField(
+        _("Permisos JSON"), default=dict, blank=True, help_text=_("Permisos específicos para este puesto (estructura JSON)")
+    )
 
     class Meta:
-        verbose_name = "Puesto de Trabajo"
-        verbose_name_plural = "Puestos de Trabajo"
+        verbose_name = _("Puesto de Trabajo")
+        verbose_name_plural = _("Puestos de Trabajo")
         ordering = ['name']
 
     def __str__(self):
         return self.name
 
 class Employee(models.Model):
-    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='employee_profile')
-    hire_date = models.DateField(default=datetime.date.today)
-    address = models.TextField(null=True, blank=True)
-    salary = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
-    position = models.ForeignKey(JobPosition, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
+    """Perfil de un empleado."""
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='employee_profile', verbose_name=_("Usuario")
+    )
+    hire_date = models.DateField(_("Fecha Contratación"), default=datetime.date.today)
+    address = models.TextField(_("Dirección"), null=True, blank=True)
+    salary = models.DecimalField(
+        _("Salario"), max_digits=10, decimal_places=2, default=Decimal('0.00')
+    )
+    position = models.ForeignKey(
+        JobPosition, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='employees', verbose_name=_("Puesto")
+    )
 
     class Meta:
-        verbose_name = "Empleado"
-        verbose_name_plural = "Empleados"
+        verbose_name = _("Empleado")
+        verbose_name_plural = _("Empleados")
         ordering = ['user__first_name', 'user__last_name']
 
     @property
@@ -123,110 +266,162 @@ class Employee(models.Model):
         return self.user.is_active
 
     def __str__(self):
-        position_name = self.position.name if self.position else "Sin puesto"
-        status = "[ACTIVO]" if self.is_active else "[INACTIVO]"
-        return f"{self.user.get_full_name() or self.user.username} ({position_name}) {status}"
+        position_name = self.position.name if self.position else _("Sin puesto")
+        status = _("[ACTIVO]") if self.is_active else _("[INACTIVO]")
+        display_name = self.user.get_full_name() or self.user.get_username()
+        return f"{display_name} ({position_name}) {status}"
 
-# ---------------------- Gestión de Pedidos (Core) ----------------------
 class Order(models.Model):
+    """Modelo principal para los pedidos de los clientes."""
     STATUS_CHOICES = [
-        ('DRAFT', 'Borrador'),
-        ('CONFIRMED', 'Confirmado'),
-        ('PLANNING', 'Planificación'),
-        ('IN_PROGRESS', 'En Progreso'),
-        ('QUALITY_CHECK', 'Control de Calidad'),
-        ('PENDING_DELIVERY', 'Pendiente Entrega'),
-        ('DELIVERED', 'Entregado'), # Estado final "completado"
-        ('CANCELLED', 'Cancelado'),
-        ('ON_HOLD', 'En Espera'),
+        ('DRAFT', _('Borrador')), ('CONFIRMED', _('Confirmado')), ('PLANNING', _('Planificación')),
+        ('IN_PROGRESS', _('En Progreso')), ('QUALITY_CHECK', _('Control de Calidad')),
+        ('PENDING_DELIVERY', _('Pendiente Entrega')), ('DELIVERED', _('Entregado')),
+        ('CANCELLED', _('Cancelado')), ('ON_HOLD', _('En Espera')),
     ]
-    FINAL_STATUSES = ['DELIVERED', 'CANCELLED'] # Para queries
+    FINAL_STATUSES = ['DELIVERED', 'CANCELLED']
 
-    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name='orders', help_text="Cliente que realiza el pedido")
-    employee = models.ForeignKey(Employee, null=True, blank=True, on_delete=models.SET_NULL, related_name='managed_orders', help_text="Empleado responsable principal")
-    date_received = models.DateTimeField(auto_now_add=True)
-    date_required = models.DateTimeField(help_text="Fecha límite solicitada por el cliente")
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT', db_index=True) # Indexar status
-    payment_due_date = models.DateTimeField(null=True, blank=True, help_text="Fecha límite para el pago (si aplica)")
-    note = models.TextField(null=True, blank=True)
-    priority = models.PositiveIntegerField(default=3, help_text="Prioridad (ej. 1=Alta, 5=Baja)") # Cambiar default si 3 es más común
-    completed_at = models.DateTimeField(null=True, blank=True, editable=False, help_text="Fecha y hora de finalización (status='DELIVERED')")
-    total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'), editable=False, help_text="Calculado de OrderService. Actualizado automáticamente.")
+    customer = models.ForeignKey(
+        Customer, on_delete=models.PROTECT, related_name='orders',
+        help_text=_("Cliente que realiza el pedido"), verbose_name=_("Cliente")
+    )
+    employee = models.ForeignKey(
+        Employee, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='managed_orders', help_text=_("Empleado responsable principal"), verbose_name=_("Empleado Asignado")
+    )
+    date_received = models.DateTimeField(_("Fecha Recepción"), auto_now_add=True)
+    date_required = models.DateTimeField(_("Fecha Requerida"), help_text=_("Fecha límite solicitada por el cliente"))
+    status = models.CharField(
+        _("Estado"), max_length=20, choices=STATUS_CHOICES, default='DRAFT', db_index=True
+    )
+    payment_due_date = models.DateTimeField(
+        _("Vencimiento Pago"), null=True, blank=True, help_text=_("Fecha límite para el pago (si aplica)")
+    )
+    note = models.TextField(_("Nota Interna"), null=True, blank=True)
+    priority = models.PositiveIntegerField(
+        _("Prioridad"), default=3, help_text=_("Prioridad (ej. 1=Alta, 5=Baja)")
+    )
+    completed_at = models.DateTimeField(
+        _("Fecha Completado"), null=True, blank=True, editable=False, help_text=_("Fecha y hora de finalización (status='DELIVERED')")
+    )
+    total_amount = models.DecimalField(
+        _("Monto Total"), max_digits=12, decimal_places=2, default=Decimal('0.00'),
+        editable=False, help_text=_("Calculado de OrderService. Actualizado automáticamente.")
+    )
 
     class Meta:
-        ordering = ['priority', '-date_received'] # Ordenar por prioridad ascendente
-        verbose_name = "Pedido"
-        verbose_name_plural = "Pedidos"
+        ordering = ['priority', '-date_received']
+        verbose_name = _("Pedido")
+        verbose_name_plural = _("Pedidos")
 
     def __str__(self):
-        return f"Pedido #{self.id} ({self.get_status_display()}) - {self.customer}"
+        customer_str = str(self.customer) if hasattr(self, 'customer') else 'N/A'
+        return f"{_('Pedido')} #{self.id} ({self.get_status_display()}) - {customer_str}"
 
     def update_total_amount(self):
         """Calcula y guarda el monto total basado en los servicios asociados."""
-        total = self.services.aggregate(
-            total=Sum(F('price') * F('quantity'))
-        )['total']
-        self.total_amount = total if total is not None else Decimal('0.00')
-        if self.pk: # Solo guardar si el objeto ya existe en la BD
-             Order.objects.filter(pk=self.pk).update(total_amount=self.total_amount) # Evita recursión de señales
+        # Se asume que self.services existe en este punto
+        total = self.services.aggregate(total=Sum(F('price') * F('quantity')))['total']
+        calculated_total = total if total is not None else Decimal('0.00')
+        # Actualizar solo si el valor calculado es diferente y el objeto ya existe
+        if self.pk and self.total_amount != calculated_total:
+             Order.objects.filter(pk=self.pk).update(total_amount=calculated_total)
+             self.total_amount = calculated_total # Actualizar instancia en memoria
 
-# ---------------------- Categorías y Campañas ----------------------
 class ServiceCategory(models.Model):
-    code = models.CharField(max_length=10, primary_key=True, help_text="Código corto de la categoría (ej. MKT, DEV)")
-    name = models.CharField(max_length=100, help_text="Nombre descriptivo de la categoría")
+    """Categorías para agrupar servicios."""
+    code = models.CharField(
+        _("Código Categoría"), max_length=10, primary_key=True,
+        help_text=_("Código corto de la categoría (ej. MKT, DEV)")
+    )
+    name = models.CharField(
+        _("Nombre Categoría"), max_length=100, help_text=_("Nombre descriptivo de la categoría")
+    )
 
     class Meta:
-        verbose_name = "Categoría de Servicio"
-        verbose_name_plural = "Categorías de Servicios"
+        verbose_name = _("Categoría de Servicio")
+        verbose_name_plural = _("Categorías de Servicios")
         ordering = ['name']
 
     def __str__(self):
         return f"{self.name} ({self.code})"
 
 class Campaign(models.Model):
-    campaign_code = models.CharField(max_length=20, primary_key=True)
-    campaign_name = models.CharField(max_length=255)
-    start_date = models.DateTimeField(help_text="Fecha y hora de inicio de la campaña")
-    end_date = models.DateTimeField(null=True, blank=True, help_text="Fecha y hora de fin (opcional)")
-    description = models.TextField(null=True, blank=True)
-    target_audience = models.JSONField(default=dict, blank=True, help_text="Descripción del público objetivo (JSON)")
-    budget = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    is_active = models.BooleanField(default=True, help_text="¿La campaña está activa actualmente?")
+    """Campañas de marketing o promocionales."""
+    campaign_code = models.CharField(_("Código Campaña"), max_length=20, primary_key=True)
+    campaign_name = models.CharField(_("Nombre Campaña"), max_length=255)
+    start_date = models.DateTimeField(_("Fecha Inicio"), help_text=_("Fecha y hora de inicio de la campaña"))
+    end_date = models.DateTimeField(
+        _("Fecha Fin"), null=True, blank=True, help_text=_("Fecha y hora de fin (opcional)")
+    )
+    description = models.TextField(_("Descripción"), null=True, blank=True)
+    target_audience = models.JSONField(
+        _("Público Objetivo"), default=dict, blank=True, help_text=_("Descripción del público objetivo (JSON)")
+    )
+    budget = models.DecimalField(
+        _("Presupuesto"), max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    is_active = models.BooleanField(
+        _("Activa"), default=True, help_text=_("¿La campaña está activa actualmente?")
+    )
 
     class Meta:
         ordering = ['-start_date']
-        verbose_name = "Campaña"
-        verbose_name_plural = "Campañas"
+        verbose_name = _("Campaña")
+        verbose_name_plural = _("Campañas")
 
     def __str__(self):
-        status = "[ACTIVA]" if self.is_active else "[INACTIVA]"
+        status = _("[ACTIVA]") if self.is_active else _("[INACTIVA]")
         return f"{self.campaign_name} ({self.campaign_code}) {status}"
 
-# ---------------------- Servicios y Precios ----------------------
 class Service(models.Model):
-    code = models.CharField(max_length=10, primary_key=True, help_text="Código único del servicio (ej. OD001)")
-    category = models.ForeignKey(ServiceCategory, on_delete=models.PROTECT, related_name='services', help_text="Categoría principal del servicio")
-    name = models.CharField(max_length=255, help_text="Nombre descriptivo del servicio")
-    is_active = models.BooleanField(default=True, help_text="¿El servicio está activo y disponible para la venta?")
-    ventulab = models.BooleanField(default=False, help_text="¿Es un servicio interno o especial de Ventulab?")
-    campaign = models.ForeignKey(Campaign, on_delete=models.SET_NULL, null=True, blank=True, related_name='promoted_services', help_text="Campaña promocional asociada directa (opcional)")
-    is_package = models.BooleanField(default=False, help_text="¿Este servicio es un paquete que agrupa otros?")
-    is_subscription = models.BooleanField(default=False, help_text="¿Este servicio es una suscripción recurrente?")
-
-    # Campos combinados de serviceDetails
-    audience = models.TextField(blank=True, null=True, help_text="Público objetivo principal de este servicio")
-    detailed_description = models.TextField(blank=True, null=True, help_text="Descripción más detallada del servicio")
-    problem_solved = models.TextField(blank=True, null=True, help_text="Qué problema o necesidad soluciona este servicio")
+    """Servicios ofrecidos por la agencia."""
+    code = models.CharField(
+        _("Código Servicio"), max_length=10, primary_key=True, help_text=_("Código único del servicio (ej. OD001)")
+    )
+    category = models.ForeignKey(
+        ServiceCategory, on_delete=models.PROTECT, related_name='services',
+        help_text=_("Categoría principal del servicio"), verbose_name=_("Categoría")
+    )
+    name = models.CharField(
+        _("Nombre Servicio"), max_length=255, help_text=_("Nombre descriptivo del servicio")
+    )
+    is_active = models.BooleanField(
+        _("Activo"), default=True, help_text=_("¿El servicio está activo y disponible para la venta?")
+    )
+    ventulab = models.BooleanField(
+        _("Ventulab"), default=False, help_text=_("¿Es un servicio interno o especial de Ventulab?")
+    )
+    campaign = models.ForeignKey(
+        Campaign, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='promoted_services', help_text=_("Campaña promocional asociada directa (opcional)"),
+        verbose_name=_("Campaña Asociada")
+    )
+    is_package = models.BooleanField(
+        _("Es Paquete"), default=False, help_text=_("¿Este servicio es un paquete que agrupa otros?")
+    )
+    is_subscription = models.BooleanField(
+        _("Es Suscripción"), default=False, help_text=_("¿Este servicio es una suscripción recurrente?")
+    )
+    audience = models.TextField(
+        _("Público Objetivo"), blank=True, null=True, help_text=_("Público objetivo principal de este servicio")
+    )
+    detailed_description = models.TextField(
+        _("Descripción Detallada"), blank=True, null=True, help_text=_("Descripción más detallada del servicio")
+    )
+    problem_solved = models.TextField(
+        _("Problema que Soluciona"), blank=True, null=True, help_text=_("Qué problema o necesidad soluciona este servicio")
+    )
 
     class Meta:
         ordering = ['category', 'name']
-        verbose_name = "Servicio"
-        verbose_name_plural = "Servicios"
+        verbose_name = _("Servicio")
+        verbose_name_plural = _("Servicios")
 
     def __str__(self):
-        package_indicator = " [Paquete]" if self.is_package else ""
-        subscription_indicator = " [Suscripción]" if self.is_subscription else ""
-        status = "[ACTIVO]" if self.is_active else "[INACTIVO]"
+        package_indicator = _(" [Paquete]") if self.is_package else ""
+        subscription_indicator = _(" [Suscripción]") if self.is_subscription else ""
+        status = _("[ACTIVO]") if self.is_active else _("[INACTIVO]")
         return f"{self.name} ({self.code}){package_indicator}{subscription_indicator} {status}"
 
     def get_current_price(self, currency='EUR'):
@@ -235,444 +430,538 @@ class Service(models.Model):
         return latest_price.amount if latest_price else None
 
 class ServiceFeature(models.Model):
+    """Características, beneficios o detalles de un servicio."""
     FEATURE_TYPES = [
-        ('differentiator', 'Diferenciador'),
-        ('benefit', 'Beneficio'),
-        ('caracteristicas', 'Características'),
-        ('process', 'Proceso'),
-        ('result', 'Resultado Esperado'),
+        ('differentiator', _('Diferenciador')), ('benefit', _('Beneficio')),
+        ('caracteristicas', _('Características')), ('process', _('Proceso')),
+        ('result', _('Resultado Esperado')),
     ]
-    service = models.ForeignKey(Service, on_delete=models.CASCADE, related_name='features')
-    feature_type = models.CharField(max_length=20, choices=FEATURE_TYPES, help_text="Tipo de característica")
-    description = models.TextField(help_text="Descripción de la característica, beneficio, etc.")
+    service = models.ForeignKey(
+        Service, on_delete=models.CASCADE, related_name='features', verbose_name=_("Servicio")
+    )
+    feature_type = models.CharField(
+        _("Tipo"), max_length=20, choices=FEATURE_TYPES, help_text=_("Tipo de característica")
+    )
+    description = models.TextField(
+        _("Descripción"), help_text=_("Descripción de la característica, beneficio, etc.")
+    )
 
     class Meta:
         ordering = ['service', 'feature_type']
-        verbose_name = "Característica de Servicio"
-        verbose_name_plural = "Características de Servicios"
+        verbose_name = _("Característica de Servicio")
+        verbose_name_plural = _("Características de Servicios")
 
     def __str__(self):
-        return f"{self.service.code} - {self.get_feature_type_display()}: {self.description[:50]}..."
+        service_code = self.service.code if hasattr(self, 'service') else 'N/A'
+        return f"{service_code} - {self.get_feature_type_display()}: {self.description[:50]}..."
 
 class Price(models.Model):
-    service = models.ForeignKey(Service, on_delete=models.CASCADE, related_name='price_history')
-    amount = models.DecimalField(max_digits=12, decimal_places=2)
-    currency = models.CharField(max_length=3, default='EUR', help_text="Código ISO 4217 (ej. EUR, USD, CLP, COP)")
-    effective_date = models.DateField(default=datetime.date.today, help_text="Fecha desde la que este precio es válido")
+    """Historial de precios para un servicio."""
+    service = models.ForeignKey(
+        Service, on_delete=models.CASCADE, related_name='price_history', verbose_name=_("Servicio")
+    )
+    amount = models.DecimalField(_("Monto"), max_digits=12, decimal_places=2)
+    currency = models.CharField(
+        _("Moneda"), max_length=3, default='EUR', help_text=_("Código ISO 4217 (ej. EUR, USD, CLP, COP)")
+    )
+    effective_date = models.DateField(
+        _("Fecha Efectiva"), default=datetime.date.today, help_text=_("Fecha desde la que este precio es válido")
+    )
 
     class Meta:
         get_latest_by = 'effective_date'
         ordering = ['service', 'currency', '-effective_date']
-        unique_together = ['service', 'currency', 'effective_date'] # Evitar duplicados exactos
-        verbose_name = "Precio Histórico"
-        verbose_name_plural = "Historial de Precios"
+        unique_together = ['service', 'currency', 'effective_date']
+        verbose_name = _("Precio Histórico")
+        verbose_name_plural = _("Historial de Precios")
 
     def __str__(self):
-        return f"Precio de {self.service.code} - {self.amount} {self.currency} (desde {self.effective_date})"
+        service_code = self.service.code if hasattr(self, 'service') else 'N/A'
+        return f"{_('Precio')} de {service_code} - {self.amount} {self.currency} ({_('desde')} {self.effective_date})"
 
-# ---------------------- Detalles de la Orden (Servicios y Entregables) ----------------------
 class OrderService(models.Model):
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='services')
-    service = models.ForeignKey(Service, on_delete=models.PROTECT, related_name='order_lines') # Proteger servicio
-    quantity = models.PositiveIntegerField(default=1)
-    price = models.DecimalField(max_digits=12, decimal_places=2, help_text="Precio unitario en el momento de añadir a la orden")
-    note = models.TextField(blank=True, help_text="Notas específicas para este servicio en esta orden")
+    """Servicio específico incluido en un pedido."""
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='services', verbose_name=_("Pedido"))
+    service = models.ForeignKey(Service, on_delete=models.PROTECT, related_name='order_lines', verbose_name=_("Servicio"))
+    quantity = models.PositiveIntegerField(_("Cantidad"), default=1)
+    price = models.DecimalField(
+        _("Precio Unitario"), max_digits=12, decimal_places=2,
+        help_text=_("Precio unitario en el momento de añadir a la orden")
+    )
+    note = models.TextField(_("Nota"), blank=True, help_text=_("Notas específicas para este servicio en esta orden"))
 
     class Meta:
-        verbose_name = "Servicio del Pedido"
-        verbose_name_plural = "Servicios del Pedido"
-        ordering = ['order', 'id'] # Ordenar por creación dentro del pedido
+        verbose_name = _("Servicio del Pedido")
+        verbose_name_plural = _("Servicios del Pedido")
+        ordering = ['order', 'id']
 
     def __str__(self):
-        return f"Servicio '{self.service.name}' x{self.quantity} en Pedido #{self.order.id}"
+        service_name = self.service.name if hasattr(self, 'service') else 'N/A'
+        order_id = self.order_id if hasattr(self, 'order_id') else 'N/A'
+        return f"{_('Servicio')} '{service_name}' x{self.quantity} en {_('Pedido')} #{order_id}"
 
     def save(self, *args, **kwargs):
-        # Autocompletar precio si es cero y existe precio base (solo en creación)
-        if (self.price is None or self.price == Decimal('0.00')) and not self.pk:
-             base_price = self.service.get_current_price(currency='EUR') # Asume EUR o la moneda principal
-             if base_price is not None:
-                 self.price = base_price
-        super().save(*args, **kwargs)
-        # La señal post_save/post_delete se encargará de actualizar Order.total_amount
+        # Asignar precio base si es nuevo y no tiene precio
+        if not self.pk and (self.price is None or self.price <= Decimal('0.00')):
+            base_price = None
+            try:
+                 if self.service_id:
+                      service_instance = Service.objects.get(pk=self.service_id)
+                      base_price = service_instance.get_current_price(currency='EUR')
+            except Service.DoesNotExist: logger.warning(f"Servicio ID {self.service_id} no encontrado al guardar OrderService.")
+            except Exception as e: logger.error(f"Error obteniendo precio base para servicio ID {self.service_id}: {e}")
+            self.price = base_price if base_price is not None else Decimal('0.00')
+        super().save(*args, **kwargs) # Llamar al save original
 
 class Deliverable(models.Model):
+    """Entregable o tarea asociada a un pedido."""
     STATUS_CHOICES = [
-        ('PENDING', 'Pendiente'),
-        ('ASSIGNED', 'Asignado'),
-        ('IN_PROGRESS', 'En Progreso'),
-        ('PENDING_APPROVAL', 'Pendiente Aprobación Cliente'),
-        ('PENDING_INTERNAL_APPROVAL', 'Pendiente Aprobación Interna'),
-        ('REQUIRES_INFO', 'Requiere Info Adicional'),
-        ('REVISION_REQUESTED', 'Revisión Solicitada'),
-        ('APPROVED', 'Aprobado'),
-        ('COMPLETED', 'Completado'),
-        ('REJECTED', 'Rechazado'),
+        ('PENDING', _('Pendiente')), ('ASSIGNED', _('Asignado')), ('IN_PROGRESS', _('En Progreso')),
+        ('PENDING_APPROVAL', _('Pendiente Aprobación Cliente')), ('PENDING_INTERNAL_APPROVAL', _('Pendiente Aprobación Interna')),
+        ('REQUIRES_INFO', _('Requiere Info Adicional')), ('REVISION_REQUESTED', _('Revisión Solicitada')),
+        ('APPROVED', _('Aprobado')), ('COMPLETED', _('Completado')), ('REJECTED', _('Rechazado')),
     ]
-    FINAL_STATUSES = ['COMPLETED', 'REJECTED'] # Constante para queries
+    FINAL_STATUSES = ['COMPLETED', 'REJECTED']
 
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='deliverables')
-    file = models.FileField(upload_to='deliverables/%Y/%m/', null=True, blank=True, help_text="Archivo entregable (opcional inicialmente)")
-    description = models.TextField(help_text="Descripción clara de la tarea o entregable")
-    created_at = models.DateTimeField(auto_now_add=True)
-    version = models.PositiveIntegerField(default=1)
-    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='PENDING', db_index=True) # Indexar status
-    due_date = models.DateField(null=True, blank=True, help_text="Fecha límite para este entregable")
-    assigned_employee = models.ForeignKey(Employee, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_deliverables')
-    assigned_provider = models.ForeignKey('Provider', on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_deliverables')
-    feedback_notes = models.TextField(blank=True, help_text="Comentarios o feedback recibido")
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='deliverables', verbose_name=_("Pedido"))
+    file = models.FileField(_("Archivo"), upload_to='deliverables/%Y/%m/', null=True, blank=True, help_text=_("Archivo entregable (opcional inicialmente)"))
+    description = models.TextField(_("Descripción"), help_text=_("Descripción clara de la tarea o entregable"))
+    created_at = models.DateTimeField(_("Fecha de Creación"), auto_now_add=True)
+    version = models.PositiveIntegerField(_("Versión"), default=1)
+    status = models.CharField(_("Estado"), max_length=30, choices=STATUS_CHOICES, default='PENDING', db_index=True)
+    due_date = models.DateField(_("Fecha Límite"), null=True, blank=True, help_text=_("Fecha límite para este entregable"))
+    assigned_employee = models.ForeignKey(Employee, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_deliverables', verbose_name=_("Empleado Asignado"))
+    assigned_provider = models.ForeignKey('Provider', on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_deliverables', verbose_name=_("Proveedor Asignado"))
+    feedback_notes = models.TextField(_("Notas de Feedback"), blank=True, help_text=_("Comentarios o feedback recibido"))
 
     class Meta:
         ordering = ['order', 'due_date', 'created_at']
-        verbose_name = "Entregable/Tarea"
-        verbose_name_plural = "Entregables/Tareas"
+        verbose_name = _("Entregable/Tarea")
+        verbose_name_plural = _("Entregables/Tareas")
 
     def __str__(self):
-        due = f" (Vence: {self.due_date})" if self.due_date else ""
-        return f"Entregable '{self.description[:30]}...' ({self.get_status_display()}){due} - Pedido #{self.order.id}"
+        due = f" ({_('Vence')}: {self.due_date})" if self.due_date else ""
+        order_id = self.order_id if hasattr(self, 'order_id') else 'N/A'
+        status_display = self.get_status_display()
+        desc_short = (self.description[:27] + '...') if len(self.description) > 30 else self.description
+        return f"{_('Entregable')} '{desc_short}' ({status_display}){due} - {_('Pedido')} #{order_id}"
 
-# ---------------------- Gestión de Pagos ----------------------
 class TransactionType(models.Model):
-    name = models.CharField(max_length=50, unique=True, help_text="Ej: Pago Cliente, Reembolso, Gasto Proveedor")
-    requires_approval = models.BooleanField(default=False)
+    """Tipos de transacciones financieras."""
+    name = models.CharField(
+        _("Nombre Tipo Transacción"), max_length=50, unique=True,
+        help_text=_("Ej: Pago Cliente, Reembolso, Gasto Proveedor")
+    )
+    requires_approval = models.BooleanField(_("Requiere Aprobación"), default=False)
 
     class Meta:
-        verbose_name = "Tipo de Transacción"
-        verbose_name_plural = "Tipos de Transacciones"
+        verbose_name = _("Tipo de Transacción")
+        verbose_name_plural = _("Tipos de Transacciones")
         ordering = ['name']
 
     def __str__(self):
         return self.name
 
 class PaymentMethod(models.Model):
-    name = models.CharField(max_length=50, unique=True, help_text="Ej: Transferencia, Tarjeta, PayPal")
-    is_active = models.BooleanField(default=True)
+    """Métodos de pago aceptados."""
+    name = models.CharField(
+        _("Nombre Método Pago"), max_length=50, unique=True,
+        help_text=_("Ej: Transferencia, Tarjeta, PayPal")
+    )
+    is_active = models.BooleanField(_("Activo"), default=True)
 
     class Meta:
-        verbose_name = "Método de Pago"
-        verbose_name_plural = "Métodos de Pago"
+        verbose_name = _("Método de Pago")
+        verbose_name_plural = _("Métodos de Pago")
         ordering = ['name']
 
     def __str__(self):
-        return f"{self.name}{'' if self.is_active else ' (Inactivo)'}"
+        return f"{self.name}{'' if self.is_active else _(' (Inactivo)')}"
 
 class Invoice(models.Model):
+    """Facturas emitidas a clientes."""
     STATUS_CHOICES = [
-        ('DRAFT', 'Borrador'),
-        ('SENT', 'Enviada'),
-        ('PAID', 'Pagada'),
-        ('PARTIALLY_PAID', 'Parcialmente Pagada'),
-        ('OVERDUE', 'Vencida'),
-        ('CANCELLED', 'Cancelada'),
-        ('VOID', 'Anulada Post-Pago'),
+        ('DRAFT', _('Borrador')), ('SENT', _('Enviada')), ('PAID', _('Pagada')),
+        ('PARTIALLY_PAID', _('Parcialmente Pagada')), ('OVERDUE', _('Vencida')),
+        ('CANCELLED', _('Cancelada')), ('VOID', _('Anulada Post-Pago')),
     ]
     FINAL_STATUSES = ['PAID', 'CANCELLED', 'VOID']
 
-    order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name='invoices', help_text="Pedido al que corresponde la factura")
-    invoice_number = models.CharField(max_length=50, unique=True, blank=True, help_text="Número de factura (puede autogenerarse)")
-    date = models.DateField(default=datetime.date.today, help_text="Fecha de emisión de la factura")
-    due_date = models.DateField(help_text="Fecha de vencimiento del pago")
-    paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'), editable=False)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT', db_index=True)
-    notes = models.TextField(blank=True, help_text="Notas o términos de la factura")
+    order = models.ForeignKey(
+        Order, on_delete=models.PROTECT, related_name='invoices',
+        help_text=_("Pedido al que corresponde la factura"), verbose_name=_("Pedido")
+    )
+    invoice_number = models.CharField(
+        _("Número Factura"), max_length=50, unique=True, blank=True,
+        help_text=_("Número de factura (puede autogenerarse)")
+    )
+    date = models.DateField(_("Fecha Emisión"), default=datetime.date.today, help_text=_("Fecha de emisión de la factura"))
+    due_date = models.DateField(_("Fecha Vencimiento"), help_text=_("Fecha de vencimiento del pago"))
+    paid_amount = models.DecimalField(
+        _("Monto Pagado"), max_digits=12, decimal_places=2, default=Decimal('0.00'), editable=False
+    )
+    status = models.CharField(
+        _("Estado"), max_length=20, choices=STATUS_CHOICES, default='DRAFT', db_index=True
+    )
+    notes = models.TextField(_("Notas/Términos"), blank=True, help_text=_("Notas o términos de la factura"))
 
     class Meta:
         ordering = ['-date', '-id']
-        verbose_name = "Factura"
-        verbose_name_plural = "Facturas"
+        verbose_name = _("Factura")
+        verbose_name_plural = _("Facturas")
 
     @property
     def total_amount(self):
-        """Retorna el monto total del pedido asociado."""
-        return self.order.total_amount
-
+        return self.order.total_amount if hasattr(self, 'order') and self.order else Decimal('0.00')
     @property
     def balance_due(self):
-        """Calcula el saldo pendiente."""
         return self.total_amount - self.paid_amount
 
     def update_paid_amount_and_status(self, trigger_notifications=True):
-        """Actualiza el monto pagado y el estado basado en los pagos asociados."""
-        original_status = self.status # Guardar estado antes de calcular
-        total_paid = self.payments.filter(status='COMPLETED').aggregate(
-            total=Sum('amount')
-        )['total'] or Decimal('0.00')
-
-        new_status = self.status # Empezar con el estado actual
-        if self.status not in ['CANCELLED', 'VOID']:
-            if total_paid >= self.total_amount and self.total_amount > 0:
-                new_status = 'PAID'
-            elif total_paid > 0:
-                new_status = 'PARTIALLY_PAID'
-            elif self.status == 'SENT' and self.due_date and self.due_date < timezone.now().date():
-                new_status = 'OVERDUE'
-            elif self.status == 'OVERDUE' and self.due_date and self.due_date >= timezone.now().date():
-                 new_status = 'SENT'
-
-        status_changed = (new_status != self.status)
-        paid_amount_changed = (total_paid != self.paid_amount)
-
-        # Guardar si el monto pagado o el estado cambiaron
-        if status_changed or paid_amount_changed:
-            self.paid_amount = total_paid
-            self.status = new_status
-            self.save(update_fields=['paid_amount', 'status'])
-
-            # Disparar notificación si cambió a OVERDUE y el flag está activo
-            if trigger_notifications and status_changed and self.status == 'OVERDUE' and self.order.customer:
-                 message = f"Recordatorio: La factura {self.invoice_number} para el pedido #{self.order.id} ha vencido."
+        """Actualiza montos y estado según pagos. Llama a create_notification si vence."""
+        original_status = self.status
+        # Usar try-except por si payments no está disponible aún (raro)
+        try: total_paid = self.payments.filter(status='COMPLETED').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        except Exception: total_paid = Decimal('0.00')
+        new_status = self.status; current_total = self.total_amount
+        if self.status not in self.FINAL_STATUSES + ['DRAFT']: # No cambiar estados finales o borrador automáticamente
+            if total_paid >= current_total and current_total > 0: new_status = 'PAID'
+            elif total_paid > 0: new_status = 'PARTIALLY_PAID'
+            elif self.due_date and self.due_date < timezone.now().date(): new_status = 'OVERDUE'
+            elif self.status == 'OVERDUE' and self.due_date and self.due_date >= timezone.now().date(): new_status = 'SENT' # Volver a SENT si ya no está vencida
+            else: new_status = 'SENT' # Estado por defecto si no es final/borrador/pagada/vencida
+        status_changed = (new_status != self.status); paid_amount_changed = (total_paid != self.paid_amount)
+        if (status_changed or paid_amount_changed) and self.pk:
+             Invoice.objects.filter(pk=self.pk).update(paid_amount=total_paid, status=new_status)
+             self.paid_amount = total_paid; self.status = new_status # Actualizar instancia
+             if trigger_notifications and status_changed and self.status == 'OVERDUE' and hasattr(self, 'order') and self.order.customer:
+                 message = f"Recordatorio: La factura {self.invoice_number} para el pedido #{self.order_id} ha vencido."
+                 # Llamar a la función global definida más abajo
                  create_notification(self.order.customer.user, message, self)
 
-
     def save(self, *args, **kwargs):
-        # Autogenerar número de factura si está vacío al crear
-        # Hacerlo en pre_save podría ser ligeramente más limpio, pero aquí funciona
+        # Autogenerar número de factura
         if not self.pk and not self.invoice_number:
-            last_invoice = Invoice.objects.order_by('id').last()
-            next_id = (last_invoice.id + 1) if last_invoice else 1
-            current_year = datetime.date.today().year
-            # Asegurarse que el número sea único para el año (más robusto)
-            while Invoice.objects.filter(invoice_number=f"INV-{current_year}-{next_id:04d}").exists():
-                next_id +=1
-            self.invoice_number = f"INV-{current_year}-{next_id:04d}"
-
-        # Evitar llamar a update_paid_amount_and_status desde save para no causar bucles si se llama desde señal
-        # La lógica de estado se maneja principalmente por la señal del pago
-        super().save(*args, **kwargs)
+            last_invoice = Invoice.objects.order_by('id').last(); next_id = (last_invoice.id + 1) if last_invoice else 1
+            current_year = datetime.date.today().year; self.invoice_number = f"INV-{current_year}-{next_id:04d}"
+            while Invoice.objects.filter(invoice_number=self.invoice_number).exists(): next_id +=1; self.invoice_number = f"INV-{current_year}-{next_id:04d}"
+        super().save(*args, **kwargs) # Guardar primero
 
     def __str__(self):
-        return f"Factura {self.invoice_number} ({self.get_status_display()}) - {self.order.customer}"
-
+        customer_str = str(self.order.customer) if hasattr(self, 'order') and self.order else 'N/A'
+        return f"{_('Factura')} {self.invoice_number} ({self.get_status_display()}) - {customer_str}"
 
 class Payment(models.Model):
-    STATUS_CHOICES = [
-        ('PENDING', 'Pendiente'),
-        ('COMPLETED', 'Completado'),
-        ('FAILED', 'Fallido'),
-        ('REFUNDED', 'Reembolsado'),
-    ]
-    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name='payments')
-    method = models.ForeignKey(PaymentMethod, on_delete=models.PROTECT, help_text="Método utilizado para el pago")
-    transaction_type = models.ForeignKey(TransactionType, on_delete=models.PROTECT, help_text="Tipo de transacción (ej. pago, reembolso)")
-    date = models.DateTimeField(default=timezone.now, help_text="Fecha y hora en que se registró el pago")
-    amount = models.DecimalField(max_digits=12, decimal_places=2)
-    currency = models.CharField(max_length=3, default='EUR')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED', db_index=True) # Indexar
-    transaction_id = models.CharField(max_length=100, blank=True, null=True, help_text="ID de la transacción externa si aplica")
-    notes = models.TextField(blank=True, help_text="Notas sobre el pago")
+    """Registro de un pago asociado a una factura."""
+    STATUS_CHOICES = [ ('PENDING', _('Pendiente')), ('COMPLETED', _('Completado')), ('FAILED', _('Fallido')), ('REFUNDED', _('Reembolsado')), ]
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name='payments', verbose_name=_("Factura"))
+    method = models.ForeignKey(PaymentMethod, on_delete=models.PROTECT, help_text=_("Método utilizado para el pago"), verbose_name=_("Método de Pago"))
+    transaction_type = models.ForeignKey(TransactionType, on_delete=models.PROTECT, help_text=_("Tipo de transacción (ej. pago, reembolso)"), verbose_name=_("Tipo Transacción"))
+    date = models.DateTimeField(_("Fecha Pago"), default=timezone.now, help_text=_("Fecha y hora en que se registró el pago"))
+    amount = models.DecimalField(_("Monto"), max_digits=12, decimal_places=2)
+    currency = models.CharField(_("Moneda"), max_length=3, default='EUR')
+    status = models.CharField(_("Estado"), max_length=20, choices=STATUS_CHOICES, default='COMPLETED', db_index=True)
+    transaction_id = models.CharField(_("ID Transacción Externa"), max_length=100, blank=True, null=True, help_text=_("ID de la transacción externa si aplica"))
+    notes = models.TextField(_("Notas"), blank=True, help_text=_("Notas sobre el pago"))
 
     class Meta:
         ordering = ['-date']
-        verbose_name = "Pago"
-        verbose_name_plural = "Pagos"
+        verbose_name = _("Pago")
+        verbose_name_plural = _("Pagos")
 
     def __str__(self):
-        return f"Pago ({self.get_status_display()}) de {self.amount} {self.currency} para Factura {self.invoice.invoice_number}"
+        invoice_num = self.invoice.invoice_number if hasattr(self, 'invoice') else 'N/A'
+        return f"{_('Pago')} ({self.get_status_display()}) de {self.amount} {self.currency} para {_('Factura')} {invoice_num}"
 
-# ---------------------- Campañas y Servicios Asociados ----------------------
 class CampaignService(models.Model):
-    campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name='included_services')
-    service = models.ForeignKey(Service, on_delete=models.CASCADE, related_name='campaign_assignments')
-    discount_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0.00'), help_text="Descuento aplicado a este servicio en la campaña (%)")
-    additional_details = models.TextField(null=True, blank=True)
+    """Relación entre una campaña y un servicio incluido."""
+    campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name='included_services', verbose_name=_("Campaña"))
+    service = models.ForeignKey(Service, on_delete=models.CASCADE, related_name='campaign_assignments', verbose_name=_("Servicio"))
+    discount_percentage = models.DecimalField(_("Descuento (%)"), max_digits=5, decimal_places=2, default=Decimal('0.00'), help_text=_("Descuento aplicado a este servicio en la campaña (%)"))
+    additional_details = models.TextField(_("Detalles Adicionales"), null=True, blank=True)
 
     class Meta:
         unique_together = ('campaign', 'service')
-        verbose_name = "Servicio de Campaña"
-        verbose_name_plural = "Servicios de Campañas"
+        verbose_name = _("Servicio de Campaña")
+        verbose_name_plural = _("Servicios de Campañas")
 
     def __str__(self):
         discount_str = f" ({self.discount_percentage}%)" if self.discount_percentage > 0 else ""
-        return f"Servicio {self.service.name} en Campaña {self.campaign.campaign_name}{discount_str}"
+        service_name = self.service.name if hasattr(self, 'service') else 'N/A'
+        campaign_name = self.campaign.campaign_name if hasattr(self, 'campaign') else 'N/A'
+        return f"{_('Servicio')} {service_name} en {_('Campaña')} {campaign_name}{discount_str}"
 
-# ---------------------- Proveedores y Colaboradores ----------------------
 class Provider(models.Model):
-    name = models.CharField(max_length=255, unique=True)
-    contact_person = models.CharField(max_length=255, null=True, blank=True)
-    email = models.EmailField(null=True, blank=True)
-    phone = models.CharField(max_length=30, null=True, blank=True)
-    services_provided = models.ManyToManyField(Service, blank=True, related_name='providers', help_text="Servicios que ofrece este proveedor")
-    rating = models.DecimalField(max_digits=3, decimal_places=1, default=Decimal('5.0'), help_text="Calificación interna (1-5)")
-    is_active = models.BooleanField(default=True)
-    notes = models.TextField(blank=True, help_text="Notas internas sobre el proveedor")
+    """Proveedores o colaboradores externos."""
+    name = models.CharField(_("Nombre Proveedor"), max_length=255, unique=True)
+    contact_person = models.CharField(_("Persona de Contacto"), max_length=255, null=True, blank=True)
+    email = models.EmailField(_("Email"), null=True, blank=True)
+    phone = models.CharField(_("Teléfono"), max_length=30, null=True, blank=True)
+    services_provided = models.ManyToManyField(
+        Service, blank=True, related_name='providers',
+        help_text=_("Servicios que ofrece este proveedor"), verbose_name=_("Servicios Ofrecidos")
+    )
+    rating = models.DecimalField(
+        _("Calificación"), max_digits=3, decimal_places=1, default=Decimal('5.0'),
+        help_text=_("Calificación interna (1-5)")
+    )
+    is_active = models.BooleanField(_("Activo"), default=True)
+    notes = models.TextField(_("Notas Internas"), blank=True, help_text=_("Notas internas sobre el proveedor"))
 
     class Meta:
-        verbose_name = "Proveedor"
-        verbose_name_plural = "Proveedores"
+        verbose_name = _("Proveedor")
+        verbose_name_plural = _("Proveedores")
         ordering = ['name']
 
     def __str__(self):
-        status = "[ACTIVO]" if self.is_active else "[INACTIVO]"
+        status = _("[ACTIVO]") if self.is_active else _("[INACTIVO]")
         return f"{self.name} {status}"
 
-# ---------------------- Mejoras Adicionales (Auditoría, Notificaciones) ----------------------
 class Notification(models.Model):
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
-    message = models.TextField()
-    read = models.BooleanField(default=False, db_index=True) # Indexar para búsquedas rápidas de no leídas
-    created_at = models.DateTimeField(auto_now_add=True)
-    link = models.URLField(null=True, blank=True, help_text="Enlace relevante (ej. a un pedido, tarea)")
+    """Notificaciones para usuarios."""
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='notifications', verbose_name=_("Usuario"))
+    message = models.TextField(_("Mensaje"))
+    read = models.BooleanField(_("Leída"), default=False, db_index=True)
+    created_at = models.DateTimeField(_("Fecha Creación"), auto_now_add=True)
+    link = models.URLField(_("Enlace"), null=True, blank=True, help_text=_("Enlace relevante (ej. a un pedido, tarea)"))
 
     class Meta:
         ordering = ['-created_at']
-        verbose_name = "Notificación"
-        verbose_name_plural = "Notificaciones"
+        verbose_name = _("Notificación")
+        verbose_name_plural = _("Notificaciones")
 
     def __str__(self):
-        status = "[Leída]" if self.read else "[No Leída]"
-        return f"Notificación para {self.user.username} {status}: {self.message[:50]}..."
+        status = _("[Leída]") if self.read else _("[No Leída]")
+        username = self.user.username if hasattr(self, 'user') else 'N/A'
+        return f"{_('Notificación')} para {username} {status}: {self.message[:50]}..."
 
 class AuditLog(models.Model):
-    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='audit_logs') # Permitir acciones del sistema
-    action = models.CharField(max_length=255, help_text="Descripción de la acción realizada") # Aumentar longitud
-    timestamp = models.DateTimeField(auto_now_add=True, db_index=True) # Indexar para búsquedas por fecha
-    details = models.JSONField(default=dict, blank=True, help_text="Detalles adicionales en formato JSON")
-    # Opcional: Enlace genérico al objeto afectado
-    # content_type = models.ForeignKey(ContentType, on_delete=models.SET_NULL, null=True, blank=True)
-    # object_id = models.PositiveIntegerField(null=True, blank=True)
-    # content_object = GenericForeignKey('content_type', 'object_id')
+    """Registro de auditoría de acciones importantes."""
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='audit_logs', verbose_name=_("Usuario")
+    )
+    action = models.CharField(
+        _("Acción"), max_length=255, help_text=_("Descripción de la acción realizada")
+    )
+    timestamp = models.DateTimeField(_("Timestamp"), auto_now_add=True, db_index=True)
+    details = models.JSONField(
+        _("Detalles"), default=dict, blank=True, help_text=_("Detalles adicionales en formato JSON")
+    )
 
     class Meta:
         ordering = ['-timestamp']
-        verbose_name = "Registro de Auditoría"
-        verbose_name_plural = "Registros de Auditoría"
+        verbose_name = _("Registro de Auditoría")
+        verbose_name_plural = _("Registros de Auditoría")
 
     def __str__(self):
-        user_str = self.user.username if self.user else "Sistema"
-        return f"{self.timestamp.strftime('%Y-%m-%d %H:%M')} - {user_str}: {self.action}"
+        user_str = self.user.username if self.user else _("Sistema")
+        timestamp_str = self.timestamp.strftime('%Y-%m-%d %H:%M') if self.timestamp else 'N/A'
+        return f"{timestamp_str} - {user_str}: {self.action}"
+
+# ==============================================================================
+# ---------------------- MÉTODOS AÑADIDOS AL MODELO USER ----------------------
+# ==============================================================================
+
+UserModel = get_user_model()
+
+# --- Propiedades y Métodos para Roles (Con Caché) ---
+@property
+def primary_role(self):
+    cache_key = '_primary_role_cache'
+    if not hasattr(self, cache_key):
+        role = None
+        try:
+            profile = getattr(self, 'profile', None)
+            if profile and profile.primary_role and profile.primary_role.is_active:
+                role = profile.primary_role
+        except Exception: pass # Captura genérica por si profile no es UserProfile
+        setattr(self, cache_key, role)
+    return getattr(self, cache_key)
+
+@property
+def primary_role_name(self):
+    role = self.primary_role; return role.name if role else None
+
+@property
+def get_secondary_active_roles(self):
+    cache_key = '_secondary_roles_cache'
+    if not hasattr(self, cache_key):
+        primary_role_id = None
+        try: primary_role_id = self.profile.primary_role_id
+        except Exception: pass
+        qs = UserRole.objects.none()
+        if self.pk:
+             qs = UserRole.objects.filter(secondary_assignments__user_id=self.pk, secondary_assignments__is_active=True, is_active=True).distinct()
+             if primary_role_id: qs = qs.exclude(id=primary_role_id)
+        setattr(self, cache_key, qs)
+    return getattr(self, cache_key)
+
+@property
+def get_secondary_active_role_names(self):
+    return list(self.get_secondary_active_roles.values_list('name', flat=True))
+
+@property
+def get_all_active_role_names(self):
+    all_roles = set(self.get_secondary_active_role_names)
+    p_role_name = self.primary_role_name
+    if p_role_name: all_roles.add(p_role_name)
+    return list(all_roles)
+
+def has_role(self, role_name):
+    if not role_name: return False
+    if self.primary_role_name == role_name: return True
+    return role_name in self.get_secondary_active_role_names
+
+def is_dragon(self):
+    # Asegurarse que Roles.DRAGON existe antes de llamar a has_role
+    dragon_role_name = getattr(Roles, 'DRAGON', None)
+    return self.has_role(dragon_role_name) if dragon_role_name else False
+
+UserModel.add_to_class("primary_role", primary_role)
+UserModel.add_to_class("primary_role_name", primary_role_name)
+UserModel.add_to_class("get_secondary_active_roles", get_secondary_active_roles)
+UserModel.add_to_class("get_secondary_active_role_names", get_secondary_active_role_names)
+UserModel.add_to_class("get_all_active_role_names", get_all_active_role_names)
+UserModel.add_to_class("has_role", has_role)
+UserModel.add_to_class("is_dragon", is_dragon)
 
 
 # ==============================================================================
 # ---------------------- SEÑALES DE LA APLICACIÓN -----------------------------
 # ==============================================================================
 
-# ---------------------- Señales de Perfil ----------------------
-@receiver(post_save, sender=User)
+# --- Señal para crear UserProfile ---
+@receiver(post_save, sender=settings.AUTH_USER_MODEL)
 def create_user_profile_signal(sender, instance, created, **kwargs):
-    """Crea perfil Customer o Employee al crear un User."""
+    if created: UserProfile.objects.get_or_create(user=instance)
+
+# --- Señal para crear Customer/Employee ---
+@receiver(post_save, sender=settings.AUTH_USER_MODEL)
+def create_customer_or_employee_profile_signal(sender, instance, created, **kwargs):
     if created:
-        if not hasattr(instance, 'employee_profile') and not hasattr(instance, 'customer_profile'):
-            if hasattr(instance, 'is_staff') and instance.is_staff:
-                Employee.objects.get_or_create(user=instance) # Usar get_or_create por si acaso
-            else:
-                Customer.objects.get_or_create(user=instance)
+        has_employee = Employee.objects.filter(user=instance).exists()
+        has_customer = Customer.objects.filter(user=instance).exists()
+        if not has_employee and not has_customer:
+            if instance.is_staff: Employee.objects.get_or_create(user=instance)
+            else: Customer.objects.get_or_create(user=instance)
 
-
-# ---------------------- Señales de Pedidos ----------------------
+# --- Señales de Pedidos ---
 @receiver(post_save, sender=OrderService)
 @receiver(post_delete, sender=OrderService)
 def update_order_total_on_service_change_signal(sender, instance, **kwargs):
-    """Actualiza Order.total_amount cuando se añade/elimina/guarda un OrderService."""
-    if hasattr(instance, 'order') and instance.order:
-        instance.order.update_total_amount()
+    if instance.order_id:
+        try:
+            order = Order.objects.get(pk=instance.order_id)
+            order.update_total_amount()
+        except Order.DoesNotExist: logger.warning(f"Order {instance.order_id} no encontrada al actualizar total desde OrderService {instance.id}. Posiblemente eliminada.")
+        except Exception as e: logger.error(f"Error inesperado actualizando total de Order {instance.order_id} desde OrderService {instance.id}: {e}")
 
 @receiver(pre_save, sender=Order)
 def set_order_completion_date_signal(sender, instance, **kwargs):
-    """Establece Order.completed_at cuando status pasa a DELIVERED."""
     original_instance = None
     if instance.pk:
-        try:
-            original_instance = Order.objects.get(pk=instance.pk)
+        try: original_instance = Order.objects.get(pk=instance.pk)
         except Order.DoesNotExist: pass
-
     if not instance.pk or original_instance:
         original_status = original_instance.status if original_instance else None
-        if instance.status == 'DELIVERED' and original_status != 'DELIVERED':
-            instance.completed_at = timezone.now()
-        elif instance.status != 'DELIVERED' and original_status == 'DELIVERED':
-             instance.completed_at = None
-        elif not instance.pk and instance.status == 'DELIVERED':
-            instance.completed_at = timezone.now()
+        if instance.status == 'DELIVERED' and original_status != 'DELIVERED': instance.completed_at = timezone.now()
+        elif instance.status != 'DELIVERED' and (original_status == 'DELIVERED' or (not instance.pk and instance.status != 'DELIVERED')): instance.completed_at = None # Limpiar si ya no está entregado
+        # elif not instance.pk and instance.status == 'DELIVERED': instance.completed_at = timezone.now() # Cubierto por primer if si status es DELIVERED
 
-
-# ---------------------- Señales de Pagos y Facturas ----------------------
+# --- Señales de Pagos y Facturas ---
 @receiver(post_save, sender=Payment)
 @receiver(post_delete, sender=Payment)
 def update_invoice_status_on_payment_signal(sender, instance, **kwargs):
-    """Actualiza Invoice.paid_amount y status cuando se guarda/elimina un Payment."""
-    # Se recalcula siempre para simplificar la lógica de "estaba completado?"
-    if hasattr(instance, 'invoice') and instance.invoice:
-        instance.invoice.update_paid_amount_and_status(trigger_notifications=True)
+    if instance.invoice_id:
+        try:
+            invoice = Invoice.objects.select_related('order__customer__user').get(pk=instance.invoice_id) # Optimizar
+            invoice.update_paid_amount_and_status()
+        except Invoice.DoesNotExist: logger.warning(f"Invoice {instance.invoice_id} no encontrada al actualizar estado desde Payment {instance.id}. Posiblemente eliminada.")
+        except Exception as e: logger.error(f"Error inesperado actualizando estado de Invoice {instance.invoice_id} desde Payment {instance.id}: {e}")
 
+# --- Helper Función Global para Notificaciones ---
+def create_notification(user_recipient, message, link_obj=None):
+    UserModelForCheck = get_user_model()
+    if not user_recipient or not isinstance(user_recipient, UserModelForCheck): return
+    link_url = None
+    if link_obj and hasattr(link_obj, 'pk') and link_obj.pk:
+        try:
+            model_name = link_obj.__class__.__name__.lower(); app_label = link_obj._meta.app_label
+            link_url = reverse(f'admin:{app_label}_{model_name}_change', args=[link_obj.pk])
+        except Exception: pass # Silenciar error si URL no se puede generar
+    try: Notification.objects.create(user=user_recipient, message=message, link=link_url)
+    except Exception as e: logger.error(f"Error al crear notificación para {user_recipient.username}: {e}")
 
-# ---------------------- Señales de Auditoría ----------------------
+# --- Señales de Auditoría ---
 def log_action(instance, action_verb, details_dict=None):
-    """Helper: Crea entradas de AuditLog."""
-    user = get_current_user()
-    model_name = instance.__class__.__name__
-    action_str = f"{model_name} {action_verb}: {str(instance)}"
-    log_details = {
-        'model': model_name,
-        'pk': instance.pk if instance.pk else None, # Manejar caso de borrado donde pk puede no estar
-        'representation': str(instance),
-    }
+    user = get_current_user(); model_name = instance.__class__.__name__
+    try: instance_str = str(instance)
+    except Exception: instance_str = f"ID {instance.pk}" if instance.pk else "objeto no guardado/eliminado"
+    action_str = f"{model_name} {action_verb}: {instance_str}"
+    log_details = {'model': model_name, 'pk': instance.pk if instance.pk else None, 'representation': instance_str}
     if details_dict: log_details.update(details_dict)
-    AuditLog.objects.create(user=user, action=action_str, details=log_details)
+    try: AuditLog.objects.create(user=user, action=action_str, details=log_details)
+    except Exception as e: logger.error(f"Error al crear AuditLog: {e}")
 
-# Lista de modelos a auditar
-AUDITED_MODELS = [Order, Invoice, Deliverable, Customer, Employee, Service, Payment, Provider, Campaign]
+AUDITED_MODELS = [Order, Invoice, Deliverable, Customer, Employee, Service, Payment, Provider, Campaign, UserProfile, UserRoleAssignment]
 
 @receiver(post_save)
 def audit_log_save_signal(sender, instance, created, **kwargs):
-    """Registra creación/actualización para modelos auditados."""
     if sender in AUDITED_MODELS:
-        action_verb = "Creado" if created else "Actualizado"
-        details = {}
-        if hasattr(instance, 'status'):
-             details['status'] = instance.get_status_display() if hasattr(instance, 'get_status_display') else instance.status
+        action_verb = "Creado" if created else "Actualizado"; details = {}
+        if hasattr(instance, 'status'): status_val = getattr(instance, 'status', None); display_method = getattr(instance, 'get_status_display', None); details['status'] = display_method() if callable(display_method) else status_val
+        if isinstance(instance, UserProfile) and instance.primary_role: details['primary_role'] = instance.primary_role.name
+        if isinstance(instance, UserRoleAssignment) and instance.role: details['role'] = instance.role.name; details['assignment_active'] = instance.is_active
         log_action(instance, action_verb, details)
 
 @receiver(post_delete)
 def audit_log_delete_signal(sender, instance, **kwargs):
-    """Registra eliminación para modelos auditados."""
-    if sender in AUDITED_MODELS:
-        log_action(instance, "Eliminado")
+    if sender in AUDITED_MODELS: log_action(instance, "Eliminado")
 
-
-# ---------------------- Señales de Notificación ----------------------
-def create_notification(user_recipient, message, link_obj=None):
-    """Helper: Crea notificaciones."""
-    if not user_recipient or not isinstance(user_recipient, User): return
-    link_url = None
-    if link_obj:
-        try:
-            model_name = link_obj.__class__.__name__.lower()
-            app_label = link_obj._meta.app_label
-            link_url = reverse(f'admin:{app_label}_{model_name}_change', args=[link_obj.pk])
-        except Exception: pass # Ignorar si no se puede generar link
-    Notification.objects.create(user=user_recipient, message=message, link=link_url)
-
+# --- Señales de Notificación ---
 @receiver(post_save, sender=Deliverable)
 def notify_deliverable_signal(sender, instance, created, **kwargs):
-    """Notifica sobre asignación o cambios de estado de Deliverable."""
-    original_instance = None
+    original_instance = None; assigned_employee_changed = False; status_changed = False
+    current_assigned_employee_id = instance.assigned_employee_id # Cachear ID actual
+
     if not created and instance.pk:
-        try: original_instance = Deliverable.objects.get(pk=instance.pk)
+        try: original_instance = Deliverable.objects.select_related('assigned_employee').get(pk=instance.pk)
         except Deliverable.DoesNotExist: pass
 
-    # Notificar Asignación
-    assigned_employee_changed = False
     if original_instance:
-         if instance.assigned_employee != original_instance.assigned_employee: assigned_employee_changed = True
-    elif created and instance.assigned_employee: assigned_employee_changed = True
+         if current_assigned_employee_id != original_instance.assigned_employee_id: assigned_employee_changed = True
+         original_status = original_instance.status
+         if original_status != instance.status: status_changed = True
+    elif created: # Si es nuevo
+        if current_assigned_employee_id: assigned_employee_changed = True # Se asignó al crear
+        status_changed = True # El status siempre cambia de 'nada' a 'PENDING' (o lo que sea)
+    else: original_status = None; status_changed = True # Caso raro: sin pk pero no creado
 
+    # Notificar nueva asignación
     if assigned_employee_changed and instance.assigned_employee:
-        message = f"Te han asignado la tarea '{instance.description[:50]}...' del Pedido #{instance.order.id}"
-        create_notification(instance.assigned_employee.user, message, instance)
+        if hasattr(instance.assigned_employee, 'user') and instance.assigned_employee.user:
+            message = f"Te han asignado la tarea '{instance.description[:50]}...' del Pedido #{instance.order_id}"
+            create_notification(instance.assigned_employee.user, message, instance)
+        else: logger.warning(f"Empleado asignado ID {current_assigned_employee_id} a Deliverable {instance.id} no tiene usuario.")
 
-    # Notificar Cambio de Estado
-    status_changed = False
-    original_status = original_instance.status if original_instance else None
-    if original_status != instance.status: status_changed = True
-
+    # Notificar cambio de estado relevante
     if status_changed:
         recipient, message = None, None
-        if instance.status == 'PENDING_APPROVAL' and instance.order.customer:
-             recipient = instance.order.customer.user
-             message = f"La tarea '{instance.description[:50]}...' del Pedido #{instance.order.id} está lista para tu aprobación."
-        elif instance.status in ['REVISION_REQUESTED', 'REQUIRES_INFO'] and instance.assigned_employee:
-             recipient = instance.assigned_employee.user
-             message = f"La tarea '{instance.description[:50]}...' (Pedido #{instance.order.id}) ahora está en estado: {instance.get_status_display()}."
-        # ... (añadir más casos) ...
-        if recipient and message: create_notification(recipient, message, instance)
-
-# La notificación de factura vencida se maneja dentro de Invoice.update_paid_amount_and_status
+        try:
+            # Solo notificar cambios de estado específicos, no todos
+            notify_states = ['PENDING_APPROVAL', 'REVISION_REQUESTED', 'REQUIRES_INFO', 'APPROVED', 'COMPLETED'] # Estados que podrían generar notificación
+            if instance.status in notify_states:
+                if instance.status == 'PENDING_APPROVAL' and instance.order.customer:
+                     recipient = instance.order.customer.user
+                     message = f"La tarea '{instance.description[:50]}...' del Pedido #{instance.order_id} está lista para tu aprobación."
+                elif instance.status in ['REVISION_REQUESTED', 'REQUIRES_INFO'] and instance.assigned_employee and hasattr(instance.assigned_employee, 'user'):
+                     recipient = instance.assigned_employee.user
+                     message = f"La tarea '{instance.description[:50]}...' (Pedido #{instance.order_id}) requiere tu atención: {instance.get_status_display()}."
+                elif instance.status == 'APPROVED' and instance.assigned_employee and hasattr(instance.assigned_employee, 'user'):
+                      recipient = instance.assigned_employee.user # Notificar al empleado que se aprobó? O al cliente?
+                      message = f"La tarea '{instance.description[:50]}...' (Pedido #{instance.order_id}) ha sido aprobada."
+                # Añadir más lógica según necesites
+            if recipient and message: create_notification(recipient, message, instance)
+        except Order.DoesNotExist: logger.warning(f"Orden {instance.order_id} no encontrada al notificar sobre Deliverable {instance.id}")
+        except Exception as e: logger.error(f"Error procesando notificación para Deliverable {instance.id}: {e}")

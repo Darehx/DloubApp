@@ -6,7 +6,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 import os
 
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-7le8=td$=jvc%icgqp0in0)iy3f-1*up&h6u2c+%rzq^$-_63r')
-DEBUG = False
+DEBUG = True
 ALLOWED_HOSTS = ['localhost']
 
 # Aplicaciones instaladas
