@@ -64,7 +64,7 @@ WSGI_APPLICATION = 'DloubApp.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'mssql',
-        'NAME': 'prueba_dloub_api',
+        'NAME': 'prueba_dloub_api2',
         'HOST': r'DORUAIN-SDO\DORUAIN',  # Usa una cadena cruda (r"")
         'PORT': '1433',
         'OPTIONS': {

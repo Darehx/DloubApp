@@ -76,60 +76,6 @@ INITIAL_PAYMENT_METHODS = [
     {"name": "Efectivo", "is_active": False},
 ]
 
-INITIAL_SERVICES = [
-    # Marketing / SMM
-    {
-        "code": "SMM001", "category_code": "SMM", "name": "Gestión Redes Sociales - Básico",
-        "is_active": True, "is_subscription": True, "detailed_description": "Paquete básico mensual (2 redes).",
-        "price": {"amount": Decimal("150.00"), "currency": "EUR"}
-    },
-    {
-        "code": "MKT001", "category_code": "MKT", "name": "Campaña Google Ads - Setup",
-        "is_active": True, "is_package": True, "detailed_description": "Configuración inicial de campaña en Google Ads.",
-        "price": {"amount": Decimal("250.00"), "currency": "EUR"}
-    },
-    # Development
-    {
-        "code": "DEV001", "category_code": "DEV", "name": "Página Web Landing",
-        "is_active": True, "is_package": True, "detailed_description": "Desarrollo de landing page optimizada.",
-        "price": {"amount": Decimal("450.00"), "currency": "EUR"}
-    },
-    {
-        "code": "DEV002", "category_code": "DEV", "name": "Mantenimiento Web Mensual",
-        "is_active": True, "is_subscription": True, "detailed_description": "Actualizaciones, backups y soporte básico.",
-        "price": {"amount": Decimal("50.00"), "currency": "EUR"}
-    },
-    # Diseño / Branding
-    {
-        "code": "BRND001", "category_code": "BRND", "name": "Diseño de Logotipo",
-        "is_active": True, "detailed_description": "Creación logo profesional (2 propuestas).",
-        "price": {"amount": Decimal("300.00"), "currency": "EUR"}
-    },
-    {
-        "code": "DSGN001", "category_code": "DSGN", "name": "Diseño Pack Redes Sociales",
-        "is_active": True, "is_package": True, "detailed_description": "Pack de 10 diseños para posts.",
-        "price": {"amount": Decimal("120.00"), "currency": "EUR"}
-    },
-    # Audiovisual
-    {
-        "code": "AVP001", "category_code": "AVP", "name": "Video Corporativo Corto",
-        "is_active": True, "is_package": True, "detailed_description": "Producción de video promocional corto (hasta 1 min).",
-        "price": {"amount": Decimal("650.00"), "currency": "EUR"}
-    },
-    # Imprenta
-    {
-        "code": "PRNT001", "category_code": "PRNT", "name": "Tarjetas de Visita (x500)",
-        "is_active": True, "detailed_description": "Impresión de 500 tarjetas de visita estándar.",
-        "price": {"amount": Decimal("45.00"), "currency": "EUR"}
-    },
-    # Consultoría
-    {
-        "code": "CONS001", "category_code": "CONS", "name": "Consultoría Estratégica (1h)",
-        "is_active": True, "detailed_description": "Sesión de consultoría de 1 hora.",
-        "price": {"amount": Decimal("90.00"), "currency": "EUR"}
-    },
-    # Añade más servicios esenciales aquí...
-]
 
 def seed_data(apps, schema_editor):
     """Función principal para poblar todos los datos iniciales."""
@@ -158,34 +104,7 @@ def seed_data(apps, schema_editor):
                 print(f"       [ERROR] Creando {model_name} '{data[unique_key]}': {e}")
         print(f"       -> {created_count} {model_name}s creados.")
 
-    # Crear Servicios y Precios
-    Service = apps.get_model('api', 'Service')
-    Price = apps.get_model('api', 'Price')
-    ServiceCategory = apps.get_model('api', 'ServiceCategory')
-    created_services = 0; created_prices = 0
-    print("     - Creando Servicios y Precios iniciales...")
-    for data in INITIAL_SERVICES:
-        category_code = data.pop("category_code", None); price_data = data.pop("price", None)
-        service_instance = None
-        if category_code:
-            try:
-                category = ServiceCategory.objects.using(db_alias).get(code=category_code)
-                service_instance, created = Service.objects.using(db_alias).get_or_create(
-                    code=data["code"], defaults={**data, 'category': category}
-                )
-                if created: created_services += 1
-                if service_instance and price_data:
-                     _, price_created = Price.objects.using(db_alias).get_or_create(
-                          service=service_instance,
-                          currency=price_data.get("currency", "EUR"),
-                          effective_date=datetime.date.today(),
-                          defaults={'amount': price_data["amount"]}
-                     )
-                     if price_created: created_prices += 1
-            except ServiceCategory.DoesNotExist: print(f"       [WARN] Categoría '{category_code}' no encontrada para servicio '{data['code']}'. Omitido.")
-            except Exception as e: print(f"       [ERROR] Creando servicio '{data['code']}': {e}")
-        else: print(f"       [WARN] Falta 'category_code' para servicio '{data['code']}'. Omitido.")
-    print(f"       -> {created_services} Servicios creados."); print(f"       -> {created_prices} Precios iniciales creados.")
+
     print("   [INFO] Finalizada creación de datos iniciales.")
 
 
@@ -194,8 +113,6 @@ def remove_initial_data(apps, schema_editor):
     db_alias = schema_editor.connection.alias
     print("\n   [REVERT] Eliminando datos iniciales...")
     models_to_clear_by_name = [ # Lista de modelos, clave única y lista de valores
-         ('api', 'Price', 'service__code', [s['code'] for s in INITIAL_SERVICES]),
-         ('api', 'Service', 'code', [s['code'] for s in INITIAL_SERVICES]),
          ('api', 'PaymentMethod', 'name', [pm['name'] for pm in INITIAL_PAYMENT_METHODS]),
          ('api', 'TransactionType', 'name', [tt['name'] for tt in INITIAL_TRANSACTION_TYPES]),
          ('api', 'ServiceCategory', 'code', [sc['code'] for sc in INITIAL_SERVICE_CATEGORIES]),
